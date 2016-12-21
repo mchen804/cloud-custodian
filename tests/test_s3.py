@@ -133,6 +133,15 @@ class BucketDelete(BaseTest):
         # Generate some versions
         generateBucketContents(s3_resource, bname)
 
+        upload_info = client.create_multipart_upload(
+            Bucket=bname, Key='abcdef12345')
+        client.upload_part(
+            Body='1' * 1024,
+            Bucket=bname,
+            Key='abcdef12345',
+            PartNumber=1,
+            UploadId=upload_info['UploadId'])
+
         p = self.load_policy({
             'name': 's3-delete-bucket',
             'resource': 's3',
@@ -148,7 +157,7 @@ class BucketDelete(BaseTest):
     def test_delete_bucket(self):
         self.patch(s3.S3, 'executor_factory', MainThreadExecutor)
         self.patch(
-            s3.EncryptExtantKeys, 'executor_factory', MainThreadExecutor)
+            s3.DeleteBucket, 'executor_factory', MainThreadExecutor)
         self.patch(s3, 'S3_AUGMENT_TABLE', [])
         session_factory = self.replay_flight_data('test_s3_delete_bucket')
         session = session_factory()

@@ -46,6 +46,8 @@ import functools
 import logging
 import re
 
+
+from distutils.version import LooseVersion
 from botocore.exceptions import ClientError
 from concurrent.futures import as_completed
 
@@ -143,8 +145,10 @@ def _db_instance_eligible_for_backup(resource):
             "DB instance %s is not in available state",
             db_instance_id)
         return False
-    # The specified DB Instance is a member of a cluster and its backup retention should not be modified directly.
-    #   Instead, modify the backup retention of the cluster using the ModifyDbCluster API
+    # The specified DB Instance is a member of a cluster and its
+    #   backup retention should not be modified directly.  Instead,
+    #   modify the backup retention of the cluster using the
+    #   ModifyDbCluster API
     if resource.get('DBClusterIdentifier', ''):
         log.debug(
             "DB instance %s is a cluster member",
@@ -198,9 +202,55 @@ def _db_instance_eligible_for_final_snapshot(resource):
     return True
 
 
+def _get_available_engine_upgrades(client, major=False):
+    """Returns all extant rds engine upgrades.
+
+    As a nested mapping of engine type to known versions
+    and their upgrades.
+
+    Defaults to minor upgrades, but configurable to major.
+
+    Example::
+
+      >>> _get_engine_upgrades(client)
+      {
+         'oracle-se2': {'12.1.0.2.v2': '12.1.0.2.v5',
+                        '12.1.0.2.v3': '12.1.0.2.v5'},
+         'postgres': {'9.3.1': '9.3.14',
+                      '9.3.10': '9.3.14',
+                      '9.3.12': '9.3.14',
+                      '9.3.2': '9.3.14'}
+      }
+    """
+    results = {}
+    engine_versions = client.describe_db_engine_versions()['DBEngineVersions']
+    for v in engine_versions:
+        if not v['Engine'] in results:
+            results[v['Engine']] = {}
+        if 'ValidUpgradeTarget' not in v or len(v['ValidUpgradeTarget']) == 0:
+            continue
+        for t in v['ValidUpgradeTarget']:
+            if not major and t['IsMajorVersionUpgrade']:
+                continue
+            if LooseVersion(t['EngineVersion']) > LooseVersion(
+                    results[v['Engine']].get(v['EngineVersion'], '0.0.0')):
+                results[v['Engine']][v['EngineVersion']] = t['EngineVersion']
+    return results
+
+
 @filters.register('default-vpc')
 class DefaultVpc(Filter):
     """ Matches if an rds database is in the default vpc
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: default-vpc-rds
+                resource: rds
+                filters:
+                  - default-vpc
     """
 
     schema = type_schema('default-vpc')
@@ -243,10 +293,24 @@ class KmsKeyAlias(ResourceKmsKeyAlias):
 
 @actions.register('mark-for-op')
 class TagDelayedAction(tags.TagDelayedAction):
+    """Mark a RDS instance for specific custodian action
 
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: mark-for-delete
+                resource: rds
+                filters:
+                  - type: default-vpc
+                actions:
+                  - type: mark-for-op
+                    op: delete
+                    days: 7
+    """
     schema = type_schema(
-        'mark-for-op', rinherit=tags.TagDelayedAction.schema,
-        ops={'enum': ['delete', 'snapshot']})
+        'mark-for-op', rinherit=tags.TagDelayedAction.schema)
 
     batch_size = 5
 
@@ -262,6 +326,27 @@ class TagDelayedAction(tags.TagDelayedAction):
 
 @actions.register('auto-patch')
 class AutoPatch(BaseAction):
+    """Toggle AutoMinorUpgrade flag on RDS instance
+
+    'window' parameter needs to be in the format 'ddd:hh:mm-ddd:hh:mm' and
+    have at least 30 minutes between start & end time.
+    If 'window' is not specified, AWS will assign a random maintenance window
+    to each instance selected.
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: enable-rds-autopatch
+                resource: rds
+                filters:
+                  - AutoMinorVersionUpgrade: false
+                actions:
+                  - type: auto-patch
+                    minor: true
+                    window: Mon:23:00-Tue:01:00
+    """
 
     schema = type_schema(
         'auto-patch',
@@ -281,9 +366,124 @@ class AutoPatch(BaseAction):
                 **params)
 
 
+@filters.register('upgrade-available')
+class UpgradeAvailable(Filter):
+    """ Scan DB instances for available engine upgrades
+
+    This will pull DB instances & check their specific engine for any
+    engine version with higher release numbers than the current one
+
+    This will also annotate the rds instance with 'target_engine' which is
+    the most recent version of the engine available
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: rds-upgrade-available
+                resource: rds
+                filters:
+                  - upgrade-available
+                    major: false
+
+    """
+
+    schema = type_schema('upgrade-available',
+                         major={'type': 'boolean'},
+                         value={'type': 'boolean'})
+
+    def process(self, resources, event=None):
+        client = local_session(self.manager.session_factory).client('rds')
+        check_upgrade_extant = self.data.get('value', True)
+        check_major = self.data.get('major', False)
+        engine_upgrades = _get_available_engine_upgrades(
+            client, major=check_major)
+        results = []
+
+        for r in resources:
+            target_upgrade = engine_upgrades.get(
+                r['Engine'], {}).get(r['EngineVersion'])
+            if target_upgrade is None:
+                if check_upgrade_extant is False:
+                    results.append(r)
+                continue
+            r['c7n-rds-engine-upgrade'] = target_upgrade
+            results.append(r)
+        return results
+
+
+@actions.register('upgrade')
+class UpgradeMinor(BaseAction):
+    """Upgrades a RDS instance to the latest major/minor version available
+
+    Use of the 'immediate' flag (default False) will automatically upgrade
+    the RDS engine disregarding the existing maintenance window.
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: upgrade-rds-minor
+                resource: rds
+                filters:
+                  - name: upgrade-available
+                    major: false
+                actions:
+                  - type: upgrade
+                    major: false
+                    immediate: false
+
+    """
+
+    schema = type_schema(
+        'upgrade', major={'type': 'boolean'}, immediate={'type': 'boolean'})
+
+    def process(self, resources):
+        client = local_session(self.manager.session_factory).client('rds')
+        engine_upgrades = None
+        for r in resources:
+            if 'EngineVersion' in r['PendingModifiedValues']:
+                # Upgrade has already been scheduled
+                continue
+            if 'c7n-rds-engine-upgrade' not in r:
+                if engine_upgrades is None:
+                    engine_upgrades = _get_available_engine_upgrades(
+                        client, major=self.data.get('major', False))
+                target = engine_upgrades.get(
+                    r['Engine'], {}).get(r['EngineVersion'])
+                if target is None:
+                    log.debug(
+                        "implicit filter no upgrade on %s",
+                        r['DBInstanceIdentifier'])
+                    continue
+                r['c7n-rds-engine-upgrade'] = target
+            client.modify_db_instance(
+                DBInstanceIdentifier=r['DBInstanceIdentifier'],
+                EngineVersion=r['c7n-rds-engine-upgrade'],
+                ApplyImmediately=self.data.get('immediate', False))
+
+
 @actions.register('tag')
 @actions.register('mark')
 class Tag(tags.Tag):
+    """Mark/tag a RDS instance with a key/value
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: rds-owner-tag
+                resource: rds
+                filters:
+                  - "tag:OwnerName": absent
+                actions:
+                  - type: tag
+                    key: OwnerName
+                    value: OwnerName
+    """
 
     concurrency = 2
     batch_size = 5
@@ -299,6 +499,21 @@ class Tag(tags.Tag):
 @actions.register('remove-tag')
 @actions.register('unmark')
 class RemoveTag(tags.RemoveTag):
+    """Removes a tag or set of tags from RDS instances
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: rds-unmark-instances
+                resource: rds
+                filters:
+                  - "tag:ExpiredTag": present
+                actions:
+                  - type: unmark
+                    tags: ["ExpiredTag"]
+    """
 
     concurrency = 2
     batch_size = 5
@@ -324,6 +539,24 @@ class TagTrim(tags.TagTrim):
 
 @actions.register('delete')
 class Delete(BaseAction):
+    """Deletes selected RDS instances
+
+    This will delete RDS instances. It is recommended to apply with a filter
+    to avoid deleting all RDS instances in the account.
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: rds-delete
+                resource: rds
+                filters:
+                  - default-vpc
+                actions:
+                  - type: delete
+                    skip-snapshot: true
+    """
 
     schema = {
         'type': 'object',
@@ -359,6 +592,18 @@ class Delete(BaseAction):
 
 @actions.register('snapshot')
 class Snapshot(BaseAction):
+    """Creates a manual snapshot of a RDS instance
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: rds-snapshot
+                resource: rds
+                actions:
+                  - snapshot
+    """
 
     schema = {'properties': {
         'type': {
@@ -392,6 +637,25 @@ class Snapshot(BaseAction):
 
 @actions.register('retention')
 class RetentionWindow(BaseAction):
+    """Sets the 'BackupRetentionPeriod' value for automated snapshots
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: rds-snapshot-retention
+                resource: rds
+                filters:
+                  - type: value
+                    key: BackupRetentionPeriod
+                    value: 7
+                    op: lt
+                actions:
+                  - type: retention
+                    days: 7
+                    copy-tags: true
+    """
 
     date_attribute = "BackupRetentionPeriod"
     schema = type_schema(
@@ -475,10 +739,10 @@ class RDSSnapshot(QueryResourceManager):
     filter_registry = FilterRegistry('rds-snapshot.filters')
     action_registry = ActionRegistry('rds-snapshot.actions')
     filter_registry.register('marked-for-op', tags.TagActionFilter)
-    
+
     _generate_arn = _account_id = None
     retry = staticmethod(get_retry(('Throttled',)))
-    
+
     @property
     def account_id(self):
         if self._account_id is None:
@@ -500,8 +764,8 @@ class RDSSnapshot(QueryResourceManager):
             snaps, self.session_factory, self.executor_factory,
             self.generate_arn, self.retry))
         return snaps
-    
-    
+
+
 def _rds_snap_tags(
         model, snaps, session_factory, executor_factory, generator, retry):
     """Augment rds snapshots with their respective tags."""
@@ -511,20 +775,37 @@ def _rds_snap_tags(
         arn = generator(snap[model.id])
         tag_list = None
         try:
-            tag_list = retry(client.list_tags_for_resource, ResourceName=arn)['TagList']
+            tag_list = retry(
+                client.list_tags_for_resource, ResourceName=arn)['TagList']
         except ClientError as e:
             if e.response['Error']['Code'] not in ['DBSnapshotNotFound']:
-                log.warning("Exception getting rds snapshot tags  \n %s", e)
+                log.warning("Exception getting rds snapshot:%s tags  \n %s", e)
             return None
         snap['Tags'] = tag_list or []
         return snap
 
     with executor_factory(max_workers=1) as w:
-        return list(w.map(process_tags, snaps))    
-    
-    
+        return filter(None, (w.map(process_tags, snaps)))
+
+
 @RDSSnapshot.filter_registry.register('age')
 class RDSSnapshotAge(AgeFilter):
+    """Filters RDS snapshots based on age (in days)
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: rds-snapshot-expired
+                resource: rds-snapshot
+                filters:
+                  - type: age
+                    days: 28
+                    op: ge
+                actions:
+                  - delete
+    """
 
     schema = type_schema(
         'age', days={'type': 'number'},
@@ -535,6 +816,24 @@ class RDSSnapshotAge(AgeFilter):
 
 @RDSSnapshot.action_registry.register('tag')
 class RDSSnapshotTag(tags.Tag):
+    """Action to tag a RDS snapshot
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: rds-snapshot-add-owner
+                resource: rds-snapshot
+                filters:
+                  - type: age
+                    days: 7
+                    op: le
+                actions:
+                  - type: tag
+                    key: rds_owner
+                    value: rds_owner_name
+    """
 
     concurrency = 2
     batch_size = 5
@@ -549,6 +848,24 @@ class RDSSnapshotTag(tags.Tag):
 
 @RDSSnapshot.action_registry.register('mark-for-op')
 class RDSSnapshotTagDelayedAction(tags.TagDelayedAction):
+    """Mark RDS snapshot resource for an operation at a later date
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: delete-stale-snapshots
+                resource: rds-snapshot
+                filters:
+                  - type: age
+                    days: 21
+                    op: eq
+                actions:
+                  - type: mark-for-op
+                    op: delete
+                    days: 7
+    """
 
     schema = type_schema(
         'mark-for-op', rinherit=tags.TagDelayedAction.schema,
@@ -566,6 +883,22 @@ class RDSSnapshotTagDelayedAction(tags.TagDelayedAction):
 @RDSSnapshot.action_registry.register('remove-tag')
 @RDSSnapshot.action_registry.register('unmark')
 class RDSSnapshotRemoveTag(tags.RemoveTag):
+    """Removes a tag/set of tags from a RDS snapshot resource
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: rds-snapshot-unmark
+                resource: rds-snapshot
+                filters:
+                  - "tag:rds_owner": present
+                actions:
+                  - type: remove-tag
+                    tags:
+                      - rds_owner
+    """
 
     concurrency = 2
     batch_size = 5
@@ -577,10 +910,26 @@ class RDSSnapshotRemoveTag(tags.RemoveTag):
             arn = self.manager.generate_arn(snap['DBSnapshotIdentifier'])
             client.remove_tags_from_resource(
                 ResourceName=arn, TagKeys=tag_keys)
-            
-            
+
+
 @RDSSnapshot.action_registry.register('delete')
 class RDSSnapshotDelete(BaseAction):
+    """Deletes a RDS snapshot resource
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: rds-snapshot-delete-stale
+                resource: rds-snapshot
+                filters:
+                  - type: age
+                    days: 28
+                    op: ge
+                actions:
+                  - delete
+    """
 
     def process(self, snapshots):
         log.info("Deleting %d rds snapshots", len(snapshots))
@@ -602,3 +951,18 @@ class RDSSnapshotDelete(BaseAction):
             c.delete_db_snapshot(
                 DBSnapshotIdentifier=s['DBSnapshotIdentifier'])
 
+
+@resources.register('rds-subnet-group')
+class RDSSubnetGroup(QueryResourceManager):
+    """RDS subnet group."""
+
+    class resource_type(object):
+        service = 'rds'
+        type = 'rds-subnet-group'
+        id = name = 'DBSubnetGroupName'
+        enum_spec = (
+            'describe_db_subnet_groups', 'DBSubnetGroups', None)
+        filter_name = 'DBSubnetGroupName'
+        filter_type = 'scalar'
+        dimension = None
+        date = None

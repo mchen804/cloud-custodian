@@ -197,14 +197,14 @@ def modify_bucket_tags(session_factory, buckets, add_tags=(), remove_tags=()):
             if (t['Key'] not in new_tags and
                     not t['Key'].startswith('aws') and
                     t['Key'] not in remove_tags):
-
                 new_tags[t['Key']] = t['Value']
         tag_set = [{'Key': k, 'Value': v} for k, v in new_tags.items()]
         try:
             client.put_bucket_tagging(
                 Bucket=bucket['Name'], Tagging={'TagSet': tag_set})
         except ClientError as e:
-            log.exception('Exception tagging bucket %s: %s' %(bucket['Name'], e))
+            log.exception(
+                'Exception tagging bucket %s: %s', (bucket['Name'], e))
             continue
 
 
@@ -223,6 +223,19 @@ class S3Metrics(MetricsFilter):
 
 @filters.register('cross-account')
 class S3CrossAccountFilter(CrossAccountAccessFilter):
+    """Filters cross-account access to S3 buckets
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: s3-acl
+                resource: s3
+                region: us-east-1
+                filters:
+                  - type: cross-account
+    """
 
     def get_accounts(self):
         """add in elb access by default
@@ -247,6 +260,20 @@ class S3CrossAccountFilter(CrossAccountAccessFilter):
 
 @filters.register('global-grants')
 class GlobalGrantsFilter(Filter):
+    """Filters for all S3 buckets that have global-grants
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: s3-delete-global-grants
+                resource: s3
+                filters:
+                  - type: global-grants
+                actions:
+                  - delete-global-grants
+    """
 
     schema = type_schema('global-grants', permissions={
         'type': 'array', 'items': {
@@ -293,7 +320,20 @@ class BucketActionBase(BaseAction):
 
 @filters.register('has-statement')
 class HasStatementFilter(Filter):
-    """Find buckets with set of named policy statements."""
+    """Find buckets with set of named policy statements.
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: s3-bucket-has-statement
+                resource: s3
+                filters:
+                  - type: has-statement
+                    statement_ids:
+                      - RequireEncryptedPutObject
+    """
     schema = type_schema(
         'has-statement',
         statement_ids={'type': 'array', 'items': {'type': 'string'}})
@@ -319,7 +359,20 @@ class HasStatementFilter(Filter):
 @filters.register('missing-statement')
 @filters.register('missing-policy-statement')
 class MissingPolicyStatementFilter(Filter):
-    """Find buckets missing a set of named policy statements."""
+    """Find buckets missing a set of named policy statements.
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: s3-bucket-missing-statement
+                resource: s3
+                filters:
+                  - type: missing-statement
+                    statement_ids:
+                      - RequireEncryptedPutObject
+    """
 
     schema = type_schema(
         'missing-policy-statement',
@@ -354,6 +407,24 @@ class NoOp(BucketActionBase):
 
 @actions.register('remove-statements')
 class RemovePolicyStatement(BucketActionBase):
+    """Action to remove policy statements from S3 buckets
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: s3-remove-encrypt-put
+                resource: s3
+                filters:
+                  - type: has-statement
+                    statement_ids:
+                      - RequireEncryptedPutObject
+                actions:
+                  - type: remove-statements
+                    statement_ids:
+                      - RequireEncryptedPutObject
+    """
 
     schema = type_schema(
         'remove-statements',
@@ -390,6 +461,23 @@ class RemovePolicyStatement(BucketActionBase):
 
 @actions.register('toggle-versioning')
 class ToggleVersioning(BucketActionBase):
+    """Action to enable/disable versioning on a S3 bucket
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: s3-enable-versioning
+                resource: s3
+                filter:
+                  - type: value
+                    key: Versioning
+                    value: Disabled
+                actions:
+                  - type: toggle-versioning
+                    enabled: true
+    """
 
     schema = type_schema(
         'enable-versioning',
@@ -417,6 +505,20 @@ class ToggleVersioning(BucketActionBase):
 
 @actions.register('attach-encrypt')
 class AttachLambdaEncrypt(BucketActionBase):
+    """Action attaches lambda encryption policy to S3 bucket
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: s3-logging-buckets
+                resource: s3
+                filters:
+                  - type: missing-policy-statement
+                actions:
+                  - attach-encrypt
+    """
     schema = type_schema(
         'attach-encrypt', role={'type': 'string'})
 
@@ -425,7 +527,7 @@ class AttachLambdaEncrypt(BucketActionBase):
         self.manager = manager
 
     def validate(self):
-        if (not self.manager.config.dryrun and
+        if (not getattr(self.manager.config, 'dryrun', True) and
                 not self.data.get('role', self.manager.config.assume_role)):
             raise ValueError(
                 "attach-encrypt: role must be specified either"
@@ -493,6 +595,22 @@ class AttachLambdaEncrypt(BucketActionBase):
 
 @actions.register('encryption-policy')
 class EncryptionRequiredPolicy(BucketActionBase):
+    """Action to apply an encryption policy to S3 buckets
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: s3-enforce-encryption
+                resource: s3
+                mode:
+                  type: cloudtrail
+                  events:
+                    - CreateBucket
+                actions:
+                  - encryption-policy
+    """
 
     permissions = ("s3:GetBucketPolicy", "s3:PutBucketPolicy")
     schema = type_schema('encryption-policy')
@@ -619,12 +737,12 @@ class ScanBucket(BucketActionBase):
     bucket_ops = {
         'standard': {
             'iterator': 'list_objects',
-            'contents_key': 'Contents',
+            'contents_key': ['Contents'],
             'key_processor': 'process_key'
             },
         'versioned': {
             'iterator': 'list_object_versions',
-            'contents_key': 'Versions',
+            'contents_key': ['Versions'],
             'key_processor': 'process_version'
             }
         }
@@ -635,7 +753,8 @@ class ScanBucket(BucketActionBase):
 
     def get_bucket_style(self, b):
         return (
-            b.get('Versioning', {'Status': ''}).get('Status') == 'Enabled'
+            b.get('Versioning', {'Status': ''}).get('Status') in (
+                'Enabled', 'Suspended')
             and 'versioned' or 'standard')
 
     def get_bucket_op(self, b, op_name):
@@ -644,6 +763,13 @@ class ScanBucket(BucketActionBase):
         if op_name == 'key_processor':
             return getattr(self, op)
         return op
+
+    def get_keys(self, b, key_set):
+        content_keys = self.get_bucket_op(b, 'contents_key')
+        keys = []
+        for ck in content_keys:
+            keys.extend(key_set.get(ck, []))
+        return keys
 
     def process(self, buckets):
         results = []
@@ -684,6 +810,7 @@ class ScanBucket(BucketActionBase):
         # bucketscan log should be used across worker boundary.
         p = s3.get_paginator(
             self.get_bucket_op(b, 'iterator')).paginate(Bucket=b['Name'])
+
         with BucketScanLog(self.manager.log_dir, b['Name']) as key_log:
             with self.executor_factory(max_workers=10) as w:
                 try:
@@ -705,21 +832,14 @@ class ScanBucket(BucketActionBase):
     __call__ = process_bucket
 
     def _process_bucket(self, b, p, key_log, w):
-        content_key = self.get_bucket_op(b, 'contents_key')
         count = 0
 
         for key_set in p:
-            count += len(key_set.get(content_key, []))
-
-            # Empty bucket check
-            if content_key not in key_set and not key_set['IsTruncated']:
-                b['KeyScanCount'] = count
-                b['KeyRemediated'] = key_log.count
-                return {'Bucket': b['Name'],
-                        'Remediated': key_log.count,
-                        'Count': count}
+            keys = self.get_keys(b, key_set)
+            count += len(keys)
             futures = []
-            for batch in chunks(key_set.get(content_key, []), size=100):
+
+            for batch in chunks(keys, size=100):
                 if not batch:
                     continue
                 futures.append(w.submit(self.process_chunk, batch, b))
@@ -736,7 +856,7 @@ class ScanBucket(BucketActionBase):
             # Log completion at info level, progress at debug level
             if key_set['IsTruncated']:
                 log.debug('Scan progress bucket:%s keys:%d remediated:%d ...',
-                         b['Name'], count, key_log.count)
+                          b['Name'], count, key_log.count)
             else:
                 log.info('Scan Complete bucket:%s keys:%d remediated:%d',
                          b['Name'], count, key_log.count)
@@ -758,6 +878,18 @@ class ScanBucket(BucketActionBase):
 
 @actions.register('encrypt-keys')
 class EncryptExtantKeys(ScanBucket):
+    """Action to encrypt unencrypted S3 objects
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: s3-encrypt-objects
+                resource: s3
+                actions:
+                  - type: encrypt-keys
+    """
 
     permissions = (
         "s3:GetObject",
@@ -863,7 +995,8 @@ class EncryptExtantKeys(ScanBucket):
                   'StorageClass': storage_class,
                   'ServerSideEncryption': crypto_method}
 
-        if key['Size'] > MAX_COPY_SIZE and self.data.get('large', True):
+        if info['ContentLength'] > MAX_COPY_SIZE and self.data.get(
+                'large', True):
             return self.process_large_file(s3, bucket_name, key, info, params)
 
         s3.copy_object(**params)
@@ -895,7 +1028,7 @@ class EncryptExtantKeys(ScanBucket):
     def process_large_file(self, s3, bucket_name, key, info, params):
         """For objects over 5gb, use multipart upload to copy"""
         part_size = MAX_COPY_SIZE - (1024 ** 2)
-        num_parts = int(math.ceil(key['Size'] / part_size))
+        num_parts = int(math.ceil(info['ContentLength'] / part_size))
         source = params.pop('CopySource')
 
         params.pop('MetadataDirective')
@@ -909,13 +1042,13 @@ class EncryptExtantKeys(ScanBucket):
                   'CopySource': "/%s/%s" % (bucket_name, key['Key']),
                   'UploadId': upload_id,
                   'CopySource': source,
-                  'CopySourceIfMatch': key['ETag']}
+                  'CopySourceIfMatch': info['ETag']}
 
         def upload_part(part_num):
             part_params = dict(params)
             part_params['CopySourceRange'] = "bytes=%d-%d" % (
                 part_size * (part_num - 1),
-                min(part_size * part_num - 1, key['Size'] - 1))
+                min(part_size * part_num - 1, info['ContentLength'] - 1))
             part_params['PartNumber'] = part_num
             response = s3.upload_part_copy(**part_params)
             return {'ETag': response['CopyPartResult']['ETag'],
@@ -957,6 +1090,16 @@ class LogTarget(Filter):
       - s3 (Access Log)
       - cfn (Template writes)
       - cloudtrail
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: s3-log-bucket
+                resource: s3
+                filters:
+                  - type: is-log-target
     """
 
     schema = type_schema('is-log-target', value={'type': 'boolean'})
@@ -1063,6 +1206,20 @@ def _query_elb_attrs(session_factory, elb_set):
 
 @actions.register('delete-global-grants')
 class DeleteGlobalGrants(BucketActionBase):
+    """Deletes global grants associated to a S3 bucket
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: s3-delete-global-grants
+                resource: s3
+                filters:
+                  - type: global-grants
+                actions:
+                  - delete-global-grants
+    """
 
     schema = type_schema(
         'delete-global-grants',
@@ -1117,6 +1274,23 @@ class DeleteGlobalGrants(BucketActionBase):
 
 @actions.register('tag')
 class BucketTag(Tag):
+    """Action to create tags on a S3 bucket
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: s3-tag-region
+                resource: s3
+                region: us-east-1
+                filters:
+                  - "tag:RegionName": absent
+                actions:
+                  - type: tag
+                    key: RegionName
+                    value: us-east-1
+    """
 
     def process_resource_set(self, resource_set, tags):
         modify_bucket_tags(self.manager.session_factory, resource_set, tags)
@@ -1124,6 +1298,24 @@ class BucketTag(Tag):
 
 @actions.register('mark-for-op')
 class MarkBucketForOp(TagDelayedAction):
+    """Action schedules custodian to perform an action at a certain date
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: s3-encrypt
+                resource: s3
+                filters:
+                  - type: missing-statement
+                    statement_ids:
+                      - RequireEncryptedPutObject
+                actions:
+                  - type: mark-for-op
+                    op: attach-encrypt
+                    days: 7
+    """
 
     schema = type_schema(
         'mark-for-op', rinherit=TagDelayedAction.schema)
@@ -1134,9 +1326,24 @@ class MarkBucketForOp(TagDelayedAction):
 
 @actions.register('unmark')
 class RemoveBucketTag(RemoveTag):
+    """Removes tag/tags from a S3 object
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: s3-remove-owner-tag
+                resource: s3
+                filters:
+                  - "tag:BucketOwner": present
+                actions:
+                  - type: unmark
+                    tags: ['BucketOwner']
+    """
 
     schema = type_schema(
-        'remove-tag', aliases=('unmark'), key={'type': 'string'})
+        'unmark', aliases=('remove-tag'), tags={'type': 'array'})
 
     def process_resource_set(self, resource_set, tags):
         modify_bucket_tags(
@@ -1145,10 +1352,71 @@ class RemoveBucketTag(RemoveTag):
 
 @actions.register('delete')
 class DeleteBucket(ScanBucket):
+    """Action deletes a S3 bucket
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: delete-unencrypted-buckets
+                resource: s3
+                filters:
+                  - type: missing-statement
+                    statement_ids:
+                      - RequireEncryptedPutObject
+                actions:
+                  - type: delete
+                    remove-contents: true
+    """
 
     schema = type_schema('delete', **{'remove-contents': {'type': 'boolean'}})
 
+    bucket_ops = {
+        'standard': {
+            'iterator': 'list_objects',
+            'contents_key': ['Contents'],
+            'key_processor': 'process_key'
+            },
+        'versioned': {
+            'iterator': 'list_object_versions',
+            'contents_key': ['Versions', 'DeleteMarkers'],
+            'key_processor': 'process_version'
+            }
+        }
+
+    def process_delete_enablement(self, b):
+        """Prep a bucket for deletion.
+
+        Clear out any pending multi-part uploads.
+
+        Disable versioning on the bucket, so deletes don't
+        generate fresh deletion markers.
+        """
+        client = local_session(self.manager.session_factory).client('s3')
+
+        # Suspend versioning, so we don't get new delete markers
+        # as we walk and delete versions
+        if (self.get_bucket_style(b) == 'versioned'
+            and b['Versioning']['Status'] == 'Enabled'
+                and self.data.get('remove-contents', True)):
+            client.put_bucket_versioning(
+                Bucket=b['Name'],
+                VersioningConfiguration={'Status': 'Suspended'})
+        # Clear our multi-part uploads
+        uploads = client.get_paginator('list_multipart_uploads')
+        for p in uploads.paginate(Bucket=b['Name']):
+            for u in p.get('Uploads', ()):
+                client.abort_multipart_upload(
+                    Bucket=b['Name'],
+                    Key=u['Key'],
+                    UploadId=u['UploadId'])
+
     def process(self, buckets):
+        # might be worth sanity checking all our permissions
+        # on the bucket up front before disabling versioning.
+        with self.executor_factory(max_workers=3) as w:
+            list(w.map(self.process_delete_enablement, buckets))
         if self.data.get('remove-contents', True):
             self.empty_buckets(buckets)
         with self.executor_factory(max_workers=3) as w:
@@ -1182,14 +1450,14 @@ class DeleteBucket(ScanBucket):
             self.manager.ctx.metrics.put_metric(
                 "Total Keys", object_count, "Count", Scope=r['Bucket'],
                 buffer=True)
-
         self.manager.ctx.metrics.put_metric(
             "Total Keys", object_count, "Count", Scope="Account", buffer=True)
         self.manager.ctx.metrics.flush()
 
         log.info(
-            ("EmptyBucket bucket:%s Complete keys:%d rate:%0.2f/s time:%0.2fs"),
-            r['Bucket'], object_count, float(object_count) / run_time, run_time)
+            "EmptyBucket buckets:%d Complete keys:%d rate:%0.2f/s time:%0.2fs",
+            len(buckets), object_count,
+            float(object_count) / run_time, run_time)
         return results
 
     def process_chunk(self, batch, bucket):
