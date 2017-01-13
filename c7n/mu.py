@@ -40,6 +40,7 @@ import c7n
 
 # Static event mapping to help simplify cwe rules creation
 from c7n.cwe import CloudWatchEvents
+from c7n.logs_support import _timestamp_from_string
 from c7n.utils import parse_s3, local_session
 
 
@@ -193,7 +194,7 @@ def custodian_archive(skip=None):
     """Create a lambda code archive for running custodian."""
 
     # Some aggressive shrinking
-    required = ["concurrent", "yaml", "pkg_resources", "skew", "ipaddress.py"]
+    required = ["pkg_resources", "ipaddress.py"]
     host_platform = platform.uname()[0]
 
     def lib_filter(root, dirs, files):
@@ -218,6 +219,7 @@ def custodian_archive(skip=None):
 class LambdaManager(object):
     """ Provides CRUD operations around lambda functions
     """
+
     def __init__(self, session_factory, s3_asset_path=None):
         self.session_factory = session_factory
         self.client = self.session_factory().client('lambda')
@@ -287,7 +289,7 @@ class LambdaManager(object):
                     f['Metrics'] = m
         return results
 
-    def logs(self, func):
+    def logs(self, func, start, end):
         logs = self.session_factory().client('logs')
         group_name = "/aws/lambda/%s" % func.name
         log.info("Fetching logs from group: %s" % group_name)
@@ -306,9 +308,15 @@ class LambdaManager(object):
             if e.response['Error']['Code'] == 'ResourceNotFoundException':
                 return
             raise
+        start = _timestamp_from_string(start)
+        end = _timestamp_from_string(end)
         for s in reversed(log_streams['logStreams']):
             result = logs.get_log_events(
-                logGroupName=group_name, logStreamName=s['logStreamName'])
+                logGroupName=group_name,
+                logStreamName=s['logStreamName'],
+                startTime=start,
+                endTime=end,
+            )
             for e in result['events']:
                 yield e
 
@@ -909,7 +917,8 @@ class BucketNotification(object):
         lambda_client = self.session.client('lambda')
         try:
             response = lambda_client.remove_permission(
-                FunctionName=func['FunctionName'], StatementId=self.bucket['Name'])
+                FunctionName=func['FunctionName'],
+                StatementId=self.bucket['Name'])
             log.debug("Removed lambda permission result: %s" % response)
         except ClientError as e:
             if e.response['Error']['Code'] != 'ResourceNotFoundException':

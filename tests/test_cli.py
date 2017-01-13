@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import os
 import shutil
 import sys
 import tempfile
 import yaml
 
-
+from argparse import ArgumentTypeError
 from common import BaseTest
 from cStringIO import StringIO
 from c7n import cli, version
@@ -92,6 +93,18 @@ class CliTest(BaseTest):
         self.fail('Error: did not raise {}.'.format(exception))
 
 
+class UtilsTest(BaseTest):
+
+    def test_key_val_pair(self):
+        self.assertRaises(
+            ArgumentTypeError,
+            cli._key_val_pair,
+            'invalid option',
+        )
+        param = 'day=today'
+        self.assertIs(cli._key_val_pair(param), param)
+
+
 class VersionTest(CliTest):
 
     def test_version(self):
@@ -108,7 +121,8 @@ class ValidateTest(CliTest):
                 'name': 'foo',
                 'resource': 's3',
                 'filters': [{"tag:custodian_tagging": "not-null"}],
-                'actions': [{'type': 'untag', 'tags': ['custodian_cleanup']}],
+                'actions': [{'type': 'untag',
+                             'tags': {'custodian_cleanup': 'yes'}}],
             }]
         }
         yaml_file = self.write_policy_file(invalid_policies)
@@ -121,7 +135,7 @@ class ValidateTest(CliTest):
         self.run_and_expect_failure(['custodian', 'validate', json_file], 1)
 
         # no config files given
-        self.run_and_expect_failure(['custodian', 'validate'], 2)
+        self.run_and_expect_failure(['custodian', 'validate'], 1)
 
         # nonexistent file given
         self.run_and_expect_exception(
@@ -133,7 +147,8 @@ class ValidateTest(CliTest):
                 'name': 'foo',
                 'resource': 's3',
                 'filters': [{"tag:custodian_tagging": "not-null"}],
-                'actions': [{'type': 'tag', 'tags': ['custodian_cleanup']}],
+                'actions': [{'type': 'tag',
+                             'tags': {'custodian_cleanup': 'yes'}}],
             }]
         }
         yaml_file = self.write_policy_file(valid_policies)
@@ -177,19 +192,19 @@ class SchemaTest(CliTest):
     def test_invalid_options(self):
 
         # invalid resource
-        self.run_and_expect_failure(['custodian', 'schema', 'fakeresource'], 2)
+        self.run_and_expect_failure(['custodian', 'schema', 'fakeresource'], 1)
 
         # invalid category
         self.run_and_expect_failure(
-            ['custodian', 'schema', 'ec2.arglbargle'], 2)
+            ['custodian', 'schema', 'ec2.arglbargle'], 1)
 
         # invalid item
         self.run_and_expect_failure(
-            ['custodian', 'schema', 'ec2.filters.nonexistent'], 2)
+            ['custodian', 'schema', 'ec2.filters.nonexistent'], 1)
 
         # invalid number of selectors
         self.run_and_expect_failure(
-            ['custodian', 'schema', 'ec2.filters.and.foo'], 2)
+            ['custodian', 'schema', 'ec2.filters.and.foo'], 1)
 
     def test_schema_output(self):
 
@@ -217,7 +232,8 @@ class ReportTest(CliTest):
                 'name': 'foo',
                 'resource': 's3',
                 'filters': [{"tag:custodian_tagging": "not-null"}],
-                'actions': [{'type': 'tag', 'tags': ['custodian_cleanup']}],
+                'actions': [{'type': 'tag',
+                             'tags': {'custodian_cleanup': 'yes'}}],
             }]
         }
         yaml_file = self.write_policy_file(valid_policies)
@@ -229,18 +245,92 @@ class ReportTest(CliTest):
         # empty file
         empty_policies = {'policies': []}
         yaml_file = self.write_policy_file(empty_policies)
-        self.run_and_expect_exception(
+        self.run_and_expect_failure(
             ['custodian', 'report', '-c', yaml_file, '-s', temp_dir],
-            AssertionError)
+            1)
+
+        # more than 1 policy
+        policies = {
+            'policies': [
+                {'name': 'foo', 'resource': 's3'},
+                { 'name': 'bar', 'resource': 'ec2'},
+            ]
+        }
+        yaml_file = self.write_policy_file(policies)
+        self.run_and_expect_failure(
+            ['custodian', 'report', '-c', yaml_file, '-s', temp_dir],
+            1)
+
+    def test_warning_on_empty_policy_filter(self):
+        """
+        This test is to examine the warning output supplied when -p is used and
+        the resulting policy set is empty.  It is not specific to the `report`
+        subcommand - it is also used by `run` and a few other subcommands.
+        """
+        policy_name = 'test-policy'
+        valid_policies = {
+            'policies':
+            [{
+                'name': policy_name,
+                'resource': 's3',
+                'filters': [{"tag:custodian_tagging": "not-null"}],
+            }]
+        }
+        yaml_file = self.write_policy_file(valid_policies)
+        temp_dir = self.get_temp_dir()
+
+        bad_policy_name = policy_name + '-nonexistent'
+        _, err = self.run_and_expect_failure(
+            ['custodian', 'report', '-c', yaml_file, '-s', temp_dir, '-p', bad_policy_name], 
+            1)
+        
+        self.assertIn('Warning', err)
+        self.assertIn(policy_name, err)
 
 
 class LogsTest(CliTest):
 
     def test_logs(self):
         temp_dir = self.get_temp_dir()
-        # empty file
+
+        # Test 1 - empty file
         empty_policies = {'policies': []}
         yaml_file = self.write_policy_file(empty_policies)
-        self.run_and_expect_exception(
-            ['custodian', 'report', '-c', yaml_file, '-s', temp_dir],
-            AssertionError)
+        self.run_and_expect_failure(
+            ['custodian', 'logs', '-c', yaml_file, '-s', temp_dir],
+            1)
+
+        # Test 2 - more than one policy
+        policies = {
+            'policies': [
+                {'name': 'foo', 'resource': 's3'},
+                { 'name': 'bar', 'resource': 'ec2'},
+            ]
+        }
+        yaml_file = self.write_policy_file(policies)
+        self.run_and_expect_failure(
+            ['custodian', 'logs', '-c', yaml_file, '-s', temp_dir],
+            1)
+
+        # Test 3 - successful test
+        p_data = {
+            'name': 'test-policy',
+            'resource': 'rds',
+            'filters': [
+                {
+                    'key': 'GroupName',
+                    'type': 'security-group',
+                    'value': 'default',
+                },
+            ],
+            'actions': [{'days': 10, 'type': 'retention'}],
+        }
+        yaml_file = self.write_policy_file({'policies': [p_data]})
+        output_dir = os.path.join(
+            os.path.dirname(__file__),
+            'data',
+            'logs',
+        )
+        self.run_and_expect_success(
+            ['custodian', 'logs', '-c', yaml_file, '-s', output_dir],
+        )

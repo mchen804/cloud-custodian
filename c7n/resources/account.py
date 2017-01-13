@@ -49,6 +49,10 @@ class Account(ResourceManager):
         id = 'account_id'
         name = 'account_name'
 
+    @classmethod
+    def get_permissions(cls):
+        return ('iam:ListAccountAliases',)
+
     def get_model(self):
         return self.resource_type
 
@@ -64,6 +68,20 @@ class CloudTrailEnabled(Filter):
     """Verify cloud trail enabled for this account per specifications.
 
     Returns an annotated account resource if trail is not enabled.
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: account-cloudtrail-enabled
+                resource: account
+                region: us-east-1
+                filters:
+                  - type: check-cloudtrail
+                    global-events: true
+                    multi-region: true
+                    running: true
     """
     schema = type_schema(
         'check-cloudtrail',
@@ -75,11 +93,13 @@ class CloudTrailEnabled(Filter):
            'kms': {'type': 'boolean'},
            'kms-key': {'type': 'string'}})
 
+    permissions = ('cloudtrail:DescribeTrails', 'cloudtrail:GetTrailStatus')
+
     def process(self, resources, event=None):
         client = local_session(
             self.manager.session_factory).client('cloudtrail')
         trails = client.describe_trails()['trailList']
-        resources[0]['cloudtrails'] = trails
+        resources[0]['c7n:cloudtrails'] = trails
         if self.data.get('global-events'):
             trails = [t for t in trails if t.get('IncludeGlobalServiceEvents')]
         if self.data.get('kms'):
@@ -110,7 +130,21 @@ class CloudTrailEnabled(Filter):
 
 @filters.register('check-config')
 class ConfigEnabled(Filter):
-    """ Is config service enabled for this account
+    """Is config service enabled for this account
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: account-check-config-services
+                resource: account
+                region: us-east-1
+                filters:
+                  - type: check-config
+                    all-resources: true
+                    global-resources: true
+                    running: true
     """
 
     schema = type_schema(
@@ -119,6 +153,10 @@ class ConfigEnabled(Filter):
             'running': {'type': 'boolean'},
             'global-resources': {'type': 'boolean'}})
 
+    permissions = ('config:DescribeDeliveryChannels',
+                   'config:DescribeConfigurationRecorders',
+                   'config:DescribeConfigurationRecorderStatus')
+
     def process(self, resources, event=None):
         client = local_session(
             self.manager.session_factory).client('config')
@@ -126,8 +164,8 @@ class ConfigEnabled(Filter):
             'DeliveryChannels']
         recorders = client.describe_configuration_recorders()[
             'ConfigurationRecorders']
-        resources[0]['config_recorders'] = recorders
-        resources[0]['config_channels'] = channels
+        resources[0]['c7n:config_recorders'] = recorders
+        resources[0]['c7n:config_channels'] = channels
         if self.data.get('global-resources'):
             recorders = [
                 r for r in recorders
@@ -139,7 +177,7 @@ class ConfigEnabled(Filter):
             status = {s['name']: s for
                       s in client.describe_configuration_recorder_status(
                       )['ConfigurationRecordersStatus']}
-            resources[0]['config_status'] = status
+            resources[0]['c7n:config_status'] = status
             recorders = [r for r in recorders
                          if status[r['name']]['recording']
                          and status[r['name']]['lastStatus'].lower() in (
@@ -201,22 +239,23 @@ class IAMSummary(ValueFilter):
         - name: root-keys-or-no-mfa
           resource: account
           filters:
-            - or:
-              - type: iam-summary
-                key: AccountMFAEnabled
-                value: 0
-              - type: iam-summary
-                key: AccountAccessKeysPresent
-                value: 0
+            - type: iam-summary
+              key: AccountMFAEnabled
+              value: true
+              op: eq
+              value_type: swap
     """
     schema = type_schema('iam-summary', rinherit=ValueFilter.schema)
 
+    permissions = ('iam:GetAccountSummary',)
+
     def process(self, resources, event=None):
-        if not resources[0].get('iam_summary'):
-            client = local_session(self.manager.session_factory).client('iam')
-            resources[0]['iam_summary'] = client.get_account_summary(
+        if not resources[0].get('c7n:iam_summary'):
+            client = local_session(
+                self.manager.session_factory).client('iam')
+            resources[0]['c7n:iam_summary'] = client.get_account_summary(
                 )['SummaryMap']
-        if self.match(resources[0]['iam_summary']):
+        if self.match(resources[0]['c7n:iam_summary']):
             return resources
         return []
 
@@ -224,15 +263,33 @@ class IAMSummary(ValueFilter):
 @filters.register('password-policy')
 class AccountPasswordPolicy(ValueFilter):
     """Check an account's password policy
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: password-policy-check
+                resource: account
+                region: us-east-1
+                filters:
+                  - type: password-policy
+                    key: MinimumPasswordLength
+                    value: 10
+                    op: ge
+                  - type: password-policy
+                    key: RequireSymbols
+                    value: true
     """
     schema = type_schema('password-policy', rinherit=ValueFilter.schema)
+    permissions = ('iam:GetAccountPasswordPolicy',)
 
     def process(self, resources, event=None):
-        if not resources[0].get('password_policy'):
+        if not resources[0].get('c7n:password_policy'):
             client = local_session(self.manager.session_factory).client('iam')
             policy = client.get_account_password_policy().get('PasswordPolicy', {})
-            resources[0]['password_policy'] = policy
-        if self.match(resources[0]['password_policy']):
+            resources[0]['c7n:password_policy'] = policy
+        if self.match(resources[0]['c7n:password_policy']):
             return resources
         return []
 
@@ -276,6 +333,19 @@ class ServiceLimit(Filter):
       - service: SES limit: Daily sending quota
       - service: VPC limit: VPCs
       - service: VPC limit: VPC Elastic IP addresses (EIPs)
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: account-service-limits
+                resource: account
+                filters:
+                  - type: service-limit
+                    services:
+                      - IAM
+                    threshold: 1.0
     """
 
     schema = type_schema(
@@ -287,8 +357,8 @@ class ServiceLimit(Filter):
             'enum': ['EC2', 'ELB', 'VPC', 'AutoScaling',
                      'RDS', 'EBS', 'SES', 'IAM']}})
 
+    permissions = ('support:DescribeTrustedAdvisorCheckResult',)
     check_id = 'eW7HH0l7J9'
-
     check_limit = ('region', 'service', 'check', 'limit', 'extant', 'color')
 
     def process(self, resources, event=None):
@@ -296,7 +366,7 @@ class ServiceLimit(Filter):
         checks = client.describe_trusted_advisor_check_result(
             checkId=self.check_id, language='en')['result']
 
-        resources[0]['ServiceLimits'] = checks
+        resources[0]['c7n:ServiceLimits'] = checks
         delta = timedelta(self.data.get('refresh_period', 1))
         check_date = parse_date(checks['timestamp'])
         if datetime.now(tz=tzutc()) - delta > check_date:
@@ -322,6 +392,6 @@ class ServiceLimit(Filter):
                 continue
             exceeded.append(limit)
         if exceeded:
-            resources[0]['ServiceLimitsExceeded'] = exceeded
+            resources[0]['c7n:ServiceLimitsExceeded'] = exceeded
             return resources
         return []

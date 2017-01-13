@@ -25,13 +25,12 @@ import time
 
 import yaml
 
-from c7n.credentials import SessionFactory
 from c7n.policy import Policy, load as policy_load
 from c7n.reports import report as do_report
 from c7n.utils import Bag, dumps
 from c7n.manager import resources
 from c7n.resources import load_resources
-from c7n import mu, schema
+from c7n import schema
 
 
 log = logging.getLogger('custodian.commands')
@@ -44,6 +43,14 @@ def policy_command(f):
         load_resources()
         collection = policy_load(options, options.config)
         policies = collection.filter(options.policy_filter)
+        
+        if options.policy_filter and len(policies) == 0 and len(collection) > 0:
+            eprint("Warning: no policies matched the filter ({})".format(options.policy_filter))
+            eprint("  Policies:")
+            for policy in collection.policies():
+                eprint("    - ", policy.name)
+            eprint()
+
         return f(options, policies)
 
     return _load_policies
@@ -57,9 +64,8 @@ def validate(options):
     if len(options.configs) < 1:
         # no configs to test
         # We don't have the parser object, so fake ArgumentParser.error
-        print('custodian validate: error: no config files specified',
-              file=sys.stderr)
-        sys.exit(2)
+        eprint('Error: no config files specified')
+        sys.exit(1)
     used_policy_names = set()
     schm = schema.generate()
     errors = []
@@ -107,13 +113,21 @@ def validate(options):
 
 
 @policy_command
+def access(options, policies):
+    permissions = set()
+    for p in policies:
+        permissions.update(p.get_permissions())
+    pprint.pprint(sorted(list(permissions)))
+
+
+@policy_command
 def run(options, policies):
     exit_code = 0
     for policy in policies:
         try:
             policy()
         except Exception:
-            exit_code = 1
+            exit_code = 2
             if options.debug:
                 raise
             log.exception(
@@ -124,8 +138,21 @@ def run(options, policies):
 
 @policy_command
 def report(options, policies):
-    assert len(policies) == 1, "Only one policy report at a time"
+    if len(policies) == 0:
+        eprint("Error: No policy supplied")
+        sys.exit(1)
+
+    if len(policies) > 1:
+        eprint("Error: Report subcommand can only operate on one policy")
+        sys.exit(1)
+    
     policy = policies.pop()
+    odir = options.output_dir.rstrip(os.path.sep)
+    if os.path.sep in odir and os.path.basename(odir) == policy.name:
+        # policy sub-directory passed - ignore
+        options.output_dir = os.path.split(odir)[0]
+        # regenerate the execution context based on new path
+        policy = Policy(policy.data, options)
     d = datetime.now()
     delta = timedelta(days=options.days)
     begin_date = d - delta
@@ -136,17 +163,17 @@ def report(options, policies):
 
 @policy_command
 def logs(options, policies):
-    assert len(policies) == 1, "Only one policy log at a time"
+    if len(policies) == 0:
+        eprint("Error: No policy supplied")
+        sys.exit(1)
+
+    if len(policies) > 1:
+        eprint("Error: Log subcommand can only operate on one policy")
+        sys.exit(1)
+
     policy = policies.pop()
 
-    if not policy.is_lambda:
-        log.debug('lambda only atm')
-        return
-
-    session_factory = SessionFactory(
-        options.region, options.profile, options.assume_role)
-    manager = mu.LambdaManager(session_factory)
-    for e in manager.logs(mu.PolicyLambda(policy)):
+    for e in policy.get_logs(options.start, options.end):
         print("%s: %s" % (
             time.strftime(
                 "%Y-%m-%d %H:%M:%S", time.localtime(e['timestamp'] / 1000)),
@@ -204,8 +231,8 @@ def schema_cmd(options):
     #
     resource = components[0].lower()
     if resource not in resource_mapping:
-        print('{} is not a valid resource'.format(resource), file=sys.stderr)
-        sys.exit(2)
+        eprint('Error: {} is not a valid resource'.format(resource))
+        sys.exit(1)
 
     if len(components) == 1:
         del(resource_mapping[resource]['classes'])
@@ -218,9 +245,9 @@ def schema_cmd(options):
     #
     category = components[1].lower()
     if category not in ('actions', 'filters'):
-        print(("Valid choices are 'actions' and 'filters'."
-               " You supplied '{}'").format(category), file=sys.stderr)
-        sys.exit(2)
+        eprint(("Error: Valid choices are 'actions' and 'filters'."
+                " You supplied '{}'").format(category))
+        sys.exit(1)
 
     if len(components) == 2:
         output = "No {} available for resource {}.".format(category, resource)
@@ -235,9 +262,9 @@ def schema_cmd(options):
     #
     item = components[2].lower()
     if item not in resource_mapping[resource][category]:
-        print('{} is not in the {} list for resource {}'.format(
-            item, category, resource), file=sys.stderr)
-        sys.exit(2)
+        eprint('Error: {} is not in the {} list for resource {}'.format(
+                item, category, resource))
+        sys.exit(1)
 
     if len(components) == 3:
         cls = resource_mapping[resource]['classes'][category][item]
@@ -263,18 +290,16 @@ def schema_cmd(options):
         return
 
     # We received too much (e.g. s3.actions.foo.bar)
-    print("Invalid selector '{}'.  Max of 3 components in the "
-          "format RESOURCE.CATEGORY.ITEM".format(options.resource),
-          file=sys.stderr)
-    sys.exit(2)
+    eprint("Invalid selector '{}'.  Max of 3 components in the "
+           "format RESOURCE.CATEGORY.ITEM".format(options.resource))
+    sys.exit(1)
 
 
 def _metrics_get_endpoints(options):
     """ Determine the start and end dates based on user-supplied options. """
     if bool(options.start) ^ bool(options.end):
-        print('Error: --start and --end must be specified together',
-              file=sys.stderr)
-        sys.exit(2)
+        eprint('Error: --start and --end must be specified together')
+        sys.exit(1)
 
     if options.start and options.end:
         start = options.start
@@ -294,3 +319,7 @@ def metrics_cmd(options, policies):
         log.info('Getting %s metrics', p)
         data[p.name] = p.get_metrics(start, end, options.period)
     print(dumps(data, indent=2))
+
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)

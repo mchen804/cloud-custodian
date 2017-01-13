@@ -37,11 +37,6 @@ Actions:
    delivery.
 
 """
-from botocore.client import Config
-from botocore.exceptions import ClientError
-from botocore.vendored.requests.exceptions import SSLError
-from concurrent.futures import as_completed
-
 import functools
 import json
 import itertools
@@ -51,21 +46,21 @@ import os
 import time
 import ssl
 
+from botocore.client import Config
+from botocore.exceptions import ClientError
+from botocore.vendored.requests.exceptions import SSLError
+from concurrent.futures import as_completed
+
 from c7n import executor
 from c7n.actions import ActionRegistry, BaseAction, AutoTagUser
 from c7n.filters import (
     FilterRegistry, Filter, CrossAccountAccessFilter, MetricsFilter)
 from c7n.manager import resources
-from c7n.query import QueryResourceManager, ResourceQuery
+from c7n.query import QueryResourceManager
 from c7n.tags import RemoveTag, Tag, TagActionFilter, TagDelayedAction
 from c7n.utils import (
     chunks, local_session, set_annotation, type_schema, dumps, get_account_id)
 
-"""
-TODO:
- - How does replication status effect in place encryption.
- - Test glacier support
-"""
 
 log = logging.getLogger('custodian.s3')
 
@@ -80,18 +75,29 @@ MAX_COPY_SIZE = 1024 * 1024 * 1024 * 2
 @resources.register('s3')
 class S3(QueryResourceManager):
 
-    #resource_type = "aws.s3.bucket"
-
-    class resource_type(ResourceQuery.resolve("aws.s3.bucket")):
+    class resource_type(object):
+        service = 's3'
+        type = 'bucket'
+        enum_spec = ('list_buckets', 'Buckets[]', None)
+        detail_spec = ('list_objects', 'Bucket', 'Contents[]')
+        name = id = 'Name'
+        filter_name = None
+        date = 'CreationDate'
         dimension = 'BucketName'
+        config_type = 'AWS::S3::Bucket'
 
-    executor_factory = executor.ThreadPoolExecutor
     filter_registry = filters
     action_registry = actions
 
     def __init__(self, ctx, data):
         super(S3, self).__init__(ctx, data)
         self.log_dir = ctx.log_dir
+
+    @classmethod
+    def get_permissions(cls):
+        perms = ["s3:ListAllMyBuckets"]
+        perms.extend([n[0] for n in S3_AUGMENT_TABLE])
+        return perms
 
     def augment(self, buckets):
         with self.executor_factory(
@@ -154,8 +160,8 @@ def assemble_bucket(item):
                 continue
             else:
                 log.warning(
-                    "Bucket:%s unable to invoke method:%s error:%s " % (
-                        b['Name'], m, e.response['Error']['Message']))
+                    "Bucket:%s unable to invoke method:%s error:%s ",
+                        b['Name'], m, e.response['Error']['Message'])
                 return None
         # As soon as we learn location (which generally works)
         if k == 'Location' and v is not None:
@@ -180,11 +186,15 @@ def bucket_client(session, b, kms=False):
         region = 'us-east-1'
     else:
         region = location['LocationConstraint'] or 'us-east-1'
+
     if kms:
-        # Need v4 signature for aws:kms crypto
-        config = Config(signature_version='s3v4', read_timeout=200)
+        # Need v4 signature for aws:kms crypto, else let the sdk decide
+        # based on region support.
+        config = Config(
+            signature_version='s3v4',
+            read_timeout=200, connect_timeout=120)
     else:
-        config = Config(read_timeout=200)
+        config = Config(read_timeout=200, connect_timeout=120)
     return session.client('s3', region_name=region, config=config)
 
 
@@ -204,7 +214,7 @@ def modify_bucket_tags(session_factory, buckets, add_tags=(), remove_tags=()):
                 Bucket=bucket['Name'], Tagging={'TagSet': tag_set})
         except ClientError as e:
             log.exception(
-                'Exception tagging bucket %s: %s', (bucket['Name'], e))
+                'Exception tagging bucket %s: %s', bucket['Name'], e)
             continue
 
 
@@ -236,6 +246,7 @@ class S3CrossAccountFilter(CrossAccountAccessFilter):
                 filters:
                   - type: cross-account
     """
+    permissions = ('s3:GetBucketPolicy',)
 
     def get_accounts(self):
         """add in elb access by default
@@ -400,6 +411,7 @@ class MissingPolicyStatementFilter(Filter):
 class NoOp(BucketActionBase):
 
     schema = type_schema('no-op')
+    permissions = ('s3:ListAllMyBuckets',)
 
     def process(self, buckets):
         return None
@@ -429,6 +441,7 @@ class RemovePolicyStatement(BucketActionBase):
     schema = type_schema(
         'remove-statements',
         statement_ids={'type': 'array', 'items': {'type': 'string'}})
+    permissions = ("s3:PutBucketPolicy", "s3:DeleteBucketPolicy")
 
     def process(self, buckets):
         with self.executor_factory(max_workers=3) as w:
@@ -461,7 +474,9 @@ class RemovePolicyStatement(BucketActionBase):
 
 @actions.register('toggle-versioning')
 class ToggleVersioning(BucketActionBase):
-    """Action to enable/disable versioning on a S3 bucket
+    """Action to enable/suspend versioning on a S3 bucket
+
+    Note versioning can never be disabled only suspended.
 
     :example:
 
@@ -473,15 +488,16 @@ class ToggleVersioning(BucketActionBase):
                 filter:
                   - type: value
                     key: Versioning
-                    value: Disabled
+                    value: Suspended
                 actions:
                   - type: toggle-versioning
                     enabled: true
     """
 
     schema = type_schema(
-        'enable-versioning',
+        'toggle-versioning',
         enabled={'type': 'boolean'})
+    permissions = ("s3:PutBucketVersioning",)
 
     # mfa delete enablement looks like it needs the serial and a current token.
     def process(self, resources):
@@ -503,6 +519,60 @@ class ToggleVersioning(BucketActionBase):
                     VersioningConfiguration={'Status': 'Suspended'})
 
 
+@actions.register('toggle-logging')
+class ToggleLogging(BucketActionBase):
+    """Action to enable/disable logging on a S3 bucket.
+
+    Target bucket ACL must allow for WRITE and READ_ACP Permissions
+    Not specifying a target_prefix will default to the current bucket name.
+    http://goo.gl/PiWWU2
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: s3-enable-logging
+                resource: s3
+                filter:
+                  - "tag:Testing": present
+                actions:
+                  - type: toggle-logging
+                    target_bucket: log-bucket
+                    target_prefix: logs123
+    """
+
+    schema = type_schema(
+        'toggle-logging',
+        enabled={'type': 'boolean'},
+        target_bucket={'type': 'string'},
+        target_prefix={'type': 'string'})
+    permissions = ("s3:PutBucketLogging",)
+
+    def process(self, resources):
+        enabled = self.data.get('enabled', True)
+        client = local_session(self.manager.session_factory).client('s3')
+        for r in resources:
+            target_prefix = self.data.get('target_prefix', r['Name'])
+            if 'TargetBucket' in r['Logging']:
+                r['Logging'] = {'Status': 'Enabled'}
+            else:
+                r['Logging'] = {'Status': 'Disabled'}
+            if enabled and (r['Logging']['Status'] == 'Disabled'):
+                client.put_bucket_logging(
+                    Bucket=r['Name'],
+                    BucketLoggingStatus={
+                        'LoggingEnabled': {
+                            'TargetBucket': self.data.get('target_bucket'),
+                            'TargetPrefix': target_prefix}})
+                continue
+            if not enabled and r['Logging']['Status'] == 'Enabled':
+                client.put_bucket_logging(
+                    Bucket=r['Name'],
+                    BucketLoggingStatus={})
+                continue
+
+
 @actions.register('attach-encrypt')
 class AttachLambdaEncrypt(BucketActionBase):
     """Action attaches lambda encryption policy to S3 bucket
@@ -521,6 +591,13 @@ class AttachLambdaEncrypt(BucketActionBase):
     """
     schema = type_schema(
         'attach-encrypt', role={'type': 'string'})
+
+    permissions = (
+        "s3:PutBucketNotification", "s3:GetBucketNotification",
+        # lambda manager uses quite a few perms to provision lambdas
+        # and event sources, hard to disamgibuate punt for now.
+        "lambda:*",
+    )
 
     def __init__(self, data=None, manager=None):
         self.data = data or {}
@@ -889,6 +966,8 @@ class EncryptExtantKeys(ScanBucket):
                 resource: s3
                 actions:
                   - type: encrypt-keys
+                    crypto: aws:kms
+                    key-id: 9c3983be-c6cf-11e6-9d9d-cec0c932ce01
     """
 
     permissions = (
@@ -900,18 +979,38 @@ class EncryptExtantKeys(ScanBucket):
 
     schema = {
         'type': 'object',
-        'additonalProperties': False,
+        'additionalProperties': False,
         'properties': {
+            'type': {'enum': ['encrypt-keys']},
             'report-only': {'type': 'boolean'},
             'glacier': {'type': 'boolean'},
             'large': {'type': 'boolean'},
-            'crypto': {'enum': ['AES256', 'aws:kms']}
+            'crypto': {'enum': ['AES256', 'aws:kms']},
+            'key-id': {'type': 'string'}
+            },
+        'dependencies': {
+            'key-id': {
+              'properties': {
+                'crypto': {'pattern': 'aws:kms'}
+              },
+              'required': ['crypto']
             }
         }
+    }
 
     metrics = [
         ('Total Keys', {'Scope': 'Account'}),
         ('Unencrypted', {'Scope': 'Account'})]
+
+    def get_permissions(self):
+        perms = ("s3:GetObject", "s3:GetObjectVersion")
+        if self.data.get('report-only'):
+            perms += ('s3:DeleteObject', 's3:DeleteObjectVersion',
+                      's3:PutObject',
+                      's3:AbortMultipartUpload',
+                      's3:ListBucket',
+                      's3:ListBucketVersions')
+        return perms
 
     def process(self, buckets):
         t = time.time()
@@ -987,6 +1086,7 @@ class EncryptExtantKeys(ScanBucket):
             storage_class == 'STANDARD'
 
         crypto_method = self.data.get('crypto', 'AES256')
+        key_id = self.data.get('key-id')
         # Note on copy we lose individual object acl grants
         params = {'Bucket': bucket_name,
                   'Key': k,
@@ -994,6 +1094,9 @@ class EncryptExtantKeys(ScanBucket):
                   'MetadataDirective': 'COPY',
                   'StorageClass': storage_class,
                   'ServerSideEncryption': crypto_method}
+
+        if key_id and crypto_method is 'aws:kms':
+            params['SSEKMSKeyId'] = key_id
 
         if info['ContentLength'] > MAX_COPY_SIZE and self.data.get(
                 'large', True):
@@ -1103,7 +1206,11 @@ class LogTarget(Filter):
     """
 
     schema = type_schema('is-log-target', value={'type': 'boolean'})
-    executor_factory = executor.MainThreadExecutor
+
+    def get_permissions(self):
+        perms = self.manager.get_resource_manager('elb').get_permissions()
+        perms += ('elasticloadbalancing:DescribeLoadBalancerAttributes',)
+        return perms
 
     def process(self, buckets, event=None):
         log_buckets = set()
@@ -1149,25 +1256,7 @@ class LogTarget(Filter):
 
     def get_elb_bucket_locations(self):
         session = local_session(self.manager.session_factory)
-        client = session.client('elb')
-
-        # Try to use the cache if it exists
-        elbs = self.manager._cache.get(
-            {'region': self.manager.config.region, 'resource': 'elb'})
-
-        # Sigh, post query refactor reuse, we can't save our cache here
-        # as that resource manager does extra lookups on tags. Not
-        # worth paginating, since with cache usage we have full set in
-        # mem.
-        if elbs is None:
-            p = client.get_paginator('describe_load_balancers')
-            results = p.paginate()
-            elbs = results.build_full_result().get(
-                'LoadBalancerDescriptions', ())
-            self.log.info("Queried %d elbs", len(elbs))
-        else:
-            self.log.info("Using %d cached elbs", len(elbs))
-
+        elbs = self.manager.get_resource_manager('elb').resources()
         get_elb_attrs = functools.partial(
             _query_elb_attrs, self.manager.session_factory)
 
@@ -1224,6 +1313,8 @@ class DeleteGlobalGrants(BucketActionBase):
     schema = type_schema(
         'delete-global-grants',
         grantees={'type': 'array', 'items': {'type': 'string'}})
+
+    permissions = ('s3:PutBucketAcl',)
 
     def process(self, buckets):
         with self.executor_factory(max_workers=5) as w:
@@ -1395,6 +1486,10 @@ class DeleteBucket(ScanBucket):
         """
         client = local_session(self.manager.session_factory).client('s3')
 
+        # Stop replication so we can suspend versioning
+        if b.get('Replication') is not None:
+            client.delete_bucket_replication(Bucket=b['Name'])
+
         # Suspend versioning, so we don't get new delete markers
         # as we walk and delete versions
         if (self.get_bucket_style(b) == 'versioned'
@@ -1403,6 +1498,7 @@ class DeleteBucket(ScanBucket):
             client.put_bucket_versioning(
                 Bucket=b['Name'],
                 VersioningConfiguration={'Status': 'Suspended'})
+
         # Clear our multi-part uploads
         uploads = client.get_paginator('list_multipart_uploads')
         for p in uploads.paginate(Bucket=b['Name']):
@@ -1414,10 +1510,10 @@ class DeleteBucket(ScanBucket):
 
     def process(self, buckets):
         # might be worth sanity checking all our permissions
-        # on the bucket up front before disabling versioning.
-        with self.executor_factory(max_workers=3) as w:
-            list(w.map(self.process_delete_enablement, buckets))
+        # on the bucket up front before disabling versioning/replication.
         if self.data.get('remove-contents', True):
+            with self.executor_factory(max_workers=3) as w:
+                list(w.map(self.process_delete_enablement, buckets))
             self.empty_buckets(buckets)
         with self.executor_factory(max_workers=3) as w:
             results = w.map(self.delete_bucket, buckets)

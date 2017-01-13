@@ -35,7 +35,7 @@ class RDSCluster(QueryResourceManager):
     """Resource manager for RDS clusters.
     """
 
-    class Meta(object):
+    class resource_type(object):
 
         service = 'rds'
         type = 'rds-cluster'
@@ -46,7 +46,6 @@ class RDSCluster(QueryResourceManager):
         dimension = 'DBClusterIdentifier'
         date = None
 
-    resource_type = Meta
     filter_registry = filters
     action_registry = actions
 
@@ -61,6 +60,10 @@ class SecurityGroupFilter(net_filters.SecurityGroupFilter):
 class SubnetFilter(net_filters.SubnetFilter):
 
     RelatedIdsExpression = ""
+
+    def get_permissions(self):
+        return self.manager.get_resource_manager(
+            'rds-subnet-group').get_permissions()
 
     def get_related_ids(self, resources):
         group_ids = set()
@@ -106,6 +109,8 @@ class Delete(BaseAction):
     schema = type_schema(
         'delete', **{'skip-snapshot': {'type': 'boolean'},
                      'delete-instances': {'type': 'boolean'}})
+
+    permissions = ('rds:DeleteDBCluster',)
 
     def process(self, clusters):
         skip = self.data.get('skip-snapshot', False)
@@ -170,6 +175,7 @@ class RetentionWindow(BaseAction):
     schema = type_schema(
         'retention',
         **{'days': {'type': 'number'}})
+    permissions = ('rds:ModifyDBCluster',)
 
     def process(self, clusters):
         with self.executor_factory(max_workers=2) as w:
@@ -219,6 +225,7 @@ class Snapshot(BaseAction):
     """
 
     schema = type_schema('snapshot')
+    permissions = ('rds:CreateDBClusterSnapshot',)
 
     def process(self, clusters):
         with self.executor_factory(max_workers=3) as w:
@@ -248,7 +255,7 @@ class RDSClusterSnapshot(QueryResourceManager):
     """Resource manager for RDS cluster snapshots.
     """
 
-    class Meta(object):
+    class resource_type(object):
 
         service = 'rds'
         type = 'rds-cluster-snapshot'
@@ -259,8 +266,6 @@ class RDSClusterSnapshot(QueryResourceManager):
         filter_type = None
         dimension = None
         date = 'SnapshotCreateTime'
-
-    resource_type = Meta
 
     filter_registry = FilterRegistry('rdscluster-snapshot.filters')
     action_registry = ActionRegistry('rdscluster-snapshot.actions')
@@ -311,6 +316,9 @@ class RDSClusterSnapshotDelete(BaseAction):
                 actions:
                   - delete
     """
+
+    schema = type_schema('delete')
+    permissions = ('rds:DeleteDBClusterSnapshot',)
 
     def process(self, snapshots):
         log.info("Deleting %d RDS cluster snapshots", len(snapshots))

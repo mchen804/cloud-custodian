@@ -14,23 +14,18 @@
 """
 Query capability built on skew metamodel
 
-
 tags_spec -> s3, elb, rds
-
-detail_spec
-   - aws.route53.healthcheck -> health check info
-   - aws.cloudformation.stack -> stack resources
-   - aws.dymanodb.table ->
 """
+import functools
+import itertools
 import jmespath
 
 from botocore.client import ClientError
-from skew.resources import find_resource_class
 
 from c7n.actions import ActionRegistry
 from c7n.filters import FilterRegistry, MetricsFilter
 from c7n.tags import register_tags
-from c7n.utils import local_session, get_retry
+from c7n.utils import local_session, get_retry, chunks
 from c7n.manager import ResourceManager
 
 
@@ -42,7 +37,7 @@ class ResourceQuery(object):
     @staticmethod
     def resolve(resource_type):
         if not isinstance(resource_type, type):
-            m = find_resource_class(resource_type).Meta
+            raise ValueError(resource_type)
         else:
             m = resource_type
         return m
@@ -70,9 +65,8 @@ class ResourceQuery(object):
             data = []
         return data
 
-    def get(self, resource_type, identity):
+    def get(self, resource_type, identities):
         """Get resources by identities
-
         """
         m = self.resolve(resource_type)
         params = {}
@@ -81,16 +75,16 @@ class ResourceQuery(object):
         # Try to formulate server side query
         if m.filter_name:
             if m.filter_type == 'list':
-                params[m.filter_name] = identity
+                params[m.filter_name] = identities
             elif m.filter_type == 'scalar':
-                assert len(identity) == 1, "Scalar server side filter"
-                params[m.filter_name] = identity[0]
+                assert len(identities) == 1, "Scalar server side filter"
+                params[m.filter_name] = identities[0]
         else:
             client_filter = True
 
         resources = self.filter(resource_type, **params)
         if client_filter:
-            resources = [r for r in resources if r[m.id] in identity]
+            resources = [r for r in resources if r[m.id] in identities]
 
         return resources
 
@@ -122,12 +116,21 @@ class QueryMeta(type):
         return super(QueryMeta, cls).__new__(cls, name, parents, attrs)
 
 
+def _napi(op_name):
+    return op_name.title().replace('_', '')
+
+
 class QueryResourceManager(ResourceManager):
 
     __metaclass__ = QueryMeta
 
     resource_type = ""
+    id_field = ""
+    report_fields = []
     retry = None
+    max_workers = 3
+    chunk_size = 20
+    permissions = ()
 
     def __init__(self, data, options):
         super(QueryResourceManager, self).__init__(data, options)
@@ -144,6 +147,17 @@ class QueryResourceManager(ResourceManager):
         if id_prefix is not None:
             return [i for i in ids if i.startswith(id_prefix)]
         return ids
+
+    @classmethod
+    def get_permissions(cls):
+        perms = []
+        m = cls.get_model()
+        perms.append('%s:%s' % (m.service, _napi(m.enum_spec[0])))
+        if getattr(m, 'detail_spec', None):
+            perms.append("%s:%s" % (m.service, _napi(m.detail_spec[0])))
+        if getattr(cls, 'permissions', None):
+            perms.extend(cls.permissions)
+        return perms
 
     def resources(self, query=None):
         key = {'region': self.config.region,
@@ -172,7 +186,17 @@ class QueryResourceManager(ResourceManager):
         self._cache.save(key, resources)
         return self.filter_resources(resources)
 
-    def get_resources(self, ids):
+    def get_resources(self, ids, cache=True):
+        key = {'region': self.config.region,
+               'resource': str(self.__class__.__name__),
+               'q': None}
+        if cache and self._cache.load():
+            resources = self._cache.get(key)
+            if resources is not None:
+                self.log.debug("Using cached results for get_resources")
+                m = self.get_model()
+                id_set = set(ids)
+                return [r for r in resources if r[m.id] in id_set]
         try:
             resources = self.query.get(self.resource_type, ids)
             resources = self.augment(resources)
@@ -187,4 +211,57 @@ class QueryResourceManager(ResourceManager):
         ie. we want tags by default (rds, elb), and policy, location, acl for
         s3 buckets.
         """
-        return resources
+        model = self.get_model()
+        if getattr(model, 'detail_spec', None):
+            detail_spec = getattr(model, 'detail_spec', None)
+            _augment = _scalar_augment
+        elif getattr(model, 'batch_detail_spec', None):
+            detail_spec = getattr(model, 'batch_detail_spec', None)
+            _augment = _batch_augment
+        else:
+            return resources
+        _augment = functools.partial(_augment, self, model, detail_spec)
+        with self.executor_factory(max_workers=self.max_workers) as w:
+            results = list(w.map(_augment, chunks(resources, self.chunk_size)))
+            return list(itertools.chain(*results))
+
+
+def _batch_augment(manager, model, detail_spec, resource_set):
+    detail_op, param_name, param_key, detail_path = detail_spec
+    client = local_session(manager.session_factory).client(model.service)
+    op = getattr(client, detail_op)
+    if manager.retry:
+        args = (op,)
+        op = manager.retry
+    else:
+        args = ()
+    kw = {param_name: [param_key and r[param_key] or r for r in resource_set]}
+    response = op(*args, **kw)
+    return response[detail_path]
+
+
+def _scalar_augment(manager, model, detail_spec, resource_set):
+    detail_op, param_name, param_key, detail_path = detail_spec
+    client = local_session(manager.session_factory).client(model.service)
+    op = getattr(client, detail_op)
+    if manager.retry:
+        args = (op,)
+        op = manager.retry
+    else:
+        args = ()
+    results = []
+    for r in resource_set:
+        kw = {param_name: param_key and r[param_key] or r}
+        response = op(*args, **kw)
+        if detail_path:
+            response = response[detail_path]
+        else:
+            response.pop('ResponseMetadata')
+        if param_key is None:
+            response[model.id] = r
+            r = response
+        else:
+            r.update(response)
+        results.append(r)
+    return results
+

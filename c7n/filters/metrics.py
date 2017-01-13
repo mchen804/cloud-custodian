@@ -31,7 +31,7 @@ class MetricsFilter(Filter):
     - GetMetricStatistics - http://goo.gl/w8mMEY
     - Supported Metrics - http://goo.gl/n0E0L7
 
-    usage:: yaml
+    .. code-block:: yaml
 
       - name: ec2-underutilized
         resource: ec2
@@ -63,6 +63,8 @@ class MetricsFilter(Filter):
         value={'type': 'number'},
         period={'type': 'number'},
         required=('value', 'name'))
+
+    permissions = ("cloudwatch:GetMetricStatistics",)
 
     MAX_QUERY_POINTS = 50850
     MAX_RESULT_POINTS = 1440
@@ -111,7 +113,7 @@ class MetricsFilter(Filter):
 
         ns = self.data.get('namespace')
         if not ns:
-            ns = getattr(self.model, 'default_namespace', None)
+            ns = getattr(self.model, 'metrics_namespace', None)
             if not ns:
                 ns = self.DEFAULT_NAMESPACE[self.model.service]
         self.namespace = ns

@@ -138,12 +138,15 @@ class Filter(object):
     log = logging.getLogger('custodian.filters')
 
     metrics = ()
-
+    permissions = ()
     schema = {'type': 'object'}
 
     def __init__(self, data, manager=None):
         self.data = data
         self.manager = manager
+
+    def get_permissions(self):
+        return self.permissions
 
     def validate(self):
         """validate filter config, return validation error or self"""
@@ -152,10 +155,6 @@ class Filter(object):
     def process(self, resources, event=None):
         """ Bulk process resources and return filtered set."""
         return filter(self, resources)
-
-    def __call__(self, instance):
-        """ Process an individual resource."""
-        raise NotImplementedError()
 
 
 class Or(Filter):

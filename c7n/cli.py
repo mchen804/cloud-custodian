@@ -15,11 +15,10 @@
 import argparse
 import importlib
 import logging
-import os
 import pdb
 import sys
 import traceback
-
+from datetime import datetime
 from dateutil.parser import parse as date_parse
 
 DEFAULT_REGION = 'us-east-1'
@@ -33,10 +32,10 @@ def _default_options(p, blacklist=""):
     """
     provider = p.add_argument_group(
         "provider", "AWS account information, defaults per the aws cli")
+
     if 'region' not in blacklist:
         provider.add_argument(
-            "-r", "--region",
-            default=os.environ.get('AWS_DEFAULT_REGION', DEFAULT_REGION),
+            "-r", "--region", default=None,
             help="AWS Region to target (Default: %(default)s)")
     provider.add_argument(
         "--profile",
@@ -117,6 +116,23 @@ def _metrics_options(p):
     p.add_argument('--period', type=int, default=60*24*24)
 
 
+def _logs_options(p):
+    """ Add options specific to logs subcommand. """
+    _default_options(p, blacklist=['cache'])
+
+    # default time range is 0 to "now" (to include all log entries)
+    p.add_argument(
+        '--start',
+        default='the beginning',  # invalid, will result in 0
+        help='Start date and/or time',
+    )
+    p.add_argument(
+        '--end',
+        default=datetime.now().strftime('%c'),
+        help='End date and/or time',
+    )
+
+
 def _schema_options(p):
     """ Add options specific to schema subcommand. """
 
@@ -134,7 +150,7 @@ def _schema_options(p):
 def _dryrun_option(p):
     p.add_argument(
         "-d", "--dryrun", action="store_true",
-        help="Don't change infrastructure but verify access.")
+        help="Don't execute actions but filter resources")
 
 
 def _key_val_pair(value):
@@ -165,7 +181,7 @@ def setup_parser():
     logs = subs.add_parser(
         'logs', help=logs_desc, description=logs_desc)
     logs.set_defaults(command="c7n.commands.logs")
-    _default_options(logs, blacklist=['cache'])
+    _logs_options(logs)
 
     metrics_desc = "Retrieve metrics for policies from CloudWatch Metrics"
     metrics = subs.add_parser(
@@ -203,6 +219,14 @@ def setup_parser():
         help="Interactive cli docs for policy authors")
     schema.set_defaults(command="c7n.commands.schema_cmd")
     _schema_options(schema)
+
+    #access_desc = ("Show permissions needed to execute the policies")
+    #access = subs.add_parser(
+    #    'access', description=access_desc, help=access_desc)
+    #access.set_defaults(command='c7n.commands.access')
+    #_default_options(access)
+    #access.add_argument(
+    #    '-m', '--access', default=False, action='store_true')
 
     run_desc = ("Execute the policies in a config file")
     run = subs.add_parser("run", description=run_desc, help=run_desc)

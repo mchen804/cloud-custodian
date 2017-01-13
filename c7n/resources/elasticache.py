@@ -22,7 +22,8 @@ from concurrent.futures import as_completed
 from dateutil.tz import tzutc
 from dateutil.parser import parse
 
-from c7n.actions import ActionRegistry, BaseAction
+from c7n.actions import (
+    ActionRegistry, BaseAction, ModifyVpcSecurityGroupsAction)
 from c7n.filters import FilterRegistry, AgeFilter, OPERATORS
 import c7n.filters.vpc as net_filters
 from c7n.manager import resources
@@ -46,11 +47,22 @@ TTYPE = re.compile('cache.t')
 @resources.register('cache-cluster')
 class ElastiCacheCluster(QueryResourceManager):
 
-    resource_type = 'aws.elasticache.cluster'
+    class resource_type(object):
+        service = 'elasticache'
+        type = 'cluster'
+        enum_spec = ('describe_cache_clusters',
+                     'CacheClusters[]', None)
+        name = id = 'CacheClusterId'
+        filter_name = 'CacheClusterId'
+        filter_type = 'scalar'
+        date = 'CacheClusterCreateTime'
+        dimension = 'CacheClusterId'
+
     filter_registry = filters
     action_registry = actions
     _generate_arn = _account_id = None
     retry = staticmethod(get_retry(('Throttled',)))
+    permissions = ('elasticache:ListTagsForResource',)
 
     @property
     def account_id(self):
@@ -141,7 +153,7 @@ class TagDelayedAction(tags.TagDelayedAction):
                     op: delete
                     days: 7
     """
-
+    permission = ('elasticache:AddTagsToResource',)
     batch_size = 1
 
     def process_resource_set(self, clusters, tags):
@@ -174,6 +186,7 @@ class RemoveTag(tags.RemoveTag):
 
     concurrency = 2
     batch_size = 5
+    permissions = ('elasticache:RemoveTagsFromResource',)
 
     def process_resource_set(self, clusters, tag_keys):
         client = local_session(
@@ -211,6 +224,8 @@ class DeleteElastiCacheCluster(BaseAction):
 
     schema = type_schema(
         'delete', **{'skip-snapshot': {'type': 'boolean'}})
+    permissions = ('elasticache:DeleteCacheCluster',
+                   'elasticache:DeleteReplicationGroup')
 
     def process(self, clusters):
         skip = self.data.get('skip-snapshot', False)
@@ -273,6 +288,9 @@ class SnapshotElastiCacheCluster(BaseAction):
                   - snapshot
     """
 
+    schema = type_schema('snapshot')
+    permissions = ('elasticache:CreateSnapshot',)
+
     def process(self, clusters):
         with self.executor_factory(max_workers=3) as w:
             futures = []
@@ -299,16 +317,63 @@ class SnapshotElastiCacheCluster(BaseAction):
             CacheClusterId=cluster['CacheClusterId'])
 
 
+@actions.register('modify-security-groups')
+class ElasticacheClusterModifyVpcSecurityGroups(ModifyVpcSecurityGroupsAction):
+    """Modify security groups on an Elasticache cluster.
+
+    Looks at the individual clusters and modifies the Replication
+    Group's configuration for Security groups so all nodes get
+    affected equally
+
+    """
+    permissions = ('elasticache:ModifyReplicationGroup',)
+
+    def process(self, clusters):
+        replication_group_map = {}
+        client = local_session(
+            self.manager.session_factory).client('elasticache')
+        groups = super(
+            ElasticacheClusterModifyVpcSecurityGroups,
+            self).get_groups(clusters, metadata_key='SecurityGroupId')
+        for idx, c in enumerate(clusters):
+            # build map of Replication Groups to Security Groups
+            replication_group_map[c['ReplicationGroupId']] = groups[idx]
+
+        for idx, r in enumerate(replication_group_map.keys()):
+            client.modify_replication_group(
+                ReplicationGroupId=r,
+                SecurityGroupIds=replication_group_map[r])
+
+
 @resources.register('cache-subnet-group')
 class ElastiCacheSubnetGroup(QueryResourceManager):
 
-    resource_type = 'aws.elasticache.subnet-group'
+    class resource_type(object):
+        service = 'elasticache'
+        type = 'subnet-group'
+        enum_spec = ('describe_cache_subnet_groups',
+                     'CacheSubnetGroups', None)
+        name = id = 'CacheSubnetGroupName'
+        filter_name = 'CacheSubnetGroupName'
+        filter_type = 'scalar'
+        date = None
+        dimension = None
 
 
 @resources.register('cache-snapshot')
 class ElastiCacheSnapshot(QueryResourceManager):
 
-    resource_type = 'aws.elasticache.snapshot'
+    class resource_type(object):
+        service = 'elasticache'
+        type = 'snapshot'
+        enum_spec = ('describe_snapshots', 'Snapshots', None)
+        name = id = 'SnapshotName'
+        filter_name = 'SnapshotName'
+        filter_type = 'scalar'
+        date = 'StartTime'
+        dimension = None
+
+    permissions = ('elasticache:ListTagsForResource',)
     filter_registry = FilterRegistry('elasticache-snapshot.filters')
     action_registry = ActionRegistry('elasticache-snapshot.actions')
     filter_registry.register('marked-for-op', tags.TagActionFilter)
@@ -402,6 +467,9 @@ class DeleteElastiCacheSnapshot(BaseAction):
                   - delete
     """
 
+    schema = type_schema('delete')
+    permissions = ('elasticache:DeleteSnapshot',)
+
     def process(self, snapshots):
         log.info("Deleting %d ElastiCache snapshots", len(snapshots))
         with self.executor_factory(max_workers=3) as w:
@@ -448,6 +516,7 @@ class ElastiCacheSnapshotTagDelayedAction(tags.TagDelayedAction):
     """
 
     batch_size = 1
+    permissions = ('elasticache:AddTagsToResource',)
 
     def process_resource_set(self, snapshots, tags):
         client = local_session(
@@ -479,6 +548,7 @@ class ElastiCacheSnapshotRemoveTag(tags.RemoveTag):
 
     concurrency = 2
     batch_size = 5
+    permissions = ('elasticache:RemoveTagsFromResource',)
 
     def process_resource_set(self, snapshots, tag_keys):
         client = local_session(

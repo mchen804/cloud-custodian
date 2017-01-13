@@ -15,7 +15,7 @@ import functools
 import json
 import shutil
 import tempfile
-import time
+import time  # NOQA needed for some recordings
 
 from unittest import TestCase
 
@@ -115,6 +115,33 @@ class BucketMetrics(BaseTest):
 
 class BucketDelete(BaseTest):
 
+    def test_delete_replicated_bucket(self):
+        # the iam setup is a little for replication to duplicate in a test
+        # preconditions - custodian-replicated and custodian-replicated-west
+        # buckets setup with replication, we're deleting the custodian-replicated
+        # bucket (source).
+        bname = 'custodian-replicated'
+        self.patch(s3.S3, 'executor_factory', MainThreadExecutor)
+        self.patch(
+            s3, 'S3_AUGMENT_TABLE',
+            [('get_bucket_replication', 'Replication', None, None),
+             ('get_bucket_versioning', 'Versioning', None, None)])
+        session_factory = self.replay_flight_data(
+            'test_s3_delete_replicated_bucket')
+        p = self.load_policy({
+            'name': 's3-delete-bucket',
+            'resource': 's3',
+            'filters': [{'Name': bname}],
+            'actions': [{'type': 'delete', 'remove-contents': True}]
+        }, session_factory=session_factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+
+        session = session_factory()
+        client = session.client('s3')
+        buckets = set([b['Name'] for b in client.list_buckets()['Buckets']])
+        self.assertFalse(bname in buckets)
+
     def test_delete_versioned_bucket(self):
         self.patch(s3.S3, 'executor_factory', MainThreadExecutor)
         self.patch(s3, 'S3_AUGMENT_TABLE',
@@ -147,7 +174,7 @@ class BucketDelete(BaseTest):
             'resource': 's3',
             'filters': [
                 {'Name': bname}],
-            'actions': [{'type': 'delete', 'empty': True}]
+            'actions': [{'type': 'delete', 'remove-contents': True}]
         }, session_factory=session_factory)
         resources = p.run()
         self.assertEqual(len(resources), 1)
@@ -171,7 +198,7 @@ class BucketDelete(BaseTest):
             'resource': 's3',
             'filters': [
                 {'Name': bname}],
-            'actions': [{'type': 'delete', 'empty': True}]
+            'actions': [{'type': 'delete', 'remove-contents': True}]
         }, session_factory=session_factory)
         resources = p.run()
         self.assertEqual(len(resources), 1)
@@ -444,6 +471,55 @@ class S3Test(BaseTest):
         versioning = client.get_bucket_versioning(Bucket=bname)['Status']
         self.assertEqual('Suspended', versioning)
 
+    def test_enable_logging(self):
+        self.patch(s3.S3, 'executor_factory', MainThreadExecutor)
+        self.patch(s3, 'S3_AUGMENT_TABLE', [
+            ('get_bucket_logging', 'Logging', None, None)])
+        session_factory = self.replay_flight_data('test_s3_enable_logging')
+        bname = 'superduper-and-magic'
+
+        session = session_factory()
+        client = session.client('s3')
+        client.create_bucket(Bucket=bname)
+        self.addCleanup(destroyBucket, client, bname)
+        p = self.load_policy({
+            'name': 's3-version',
+            'resource': 's3',
+            'filters': [{'Name': bname}],
+            'actions': [
+                {'type': 'toggle-logging',
+                 'target_bucket': bname}]
+            }, session_factory=session_factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0]['Name'], bname)
+
+        # eventual consistency fun for recording
+        #time.sleep(10)
+        logging = client.get_bucket_logging(Bucket=bname)['Status']
+        self.assertEqual('Enabled', logging)
+
+        # running against a bucket with logging already on
+        # is idempotent
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+
+        p = self.load_policy({
+            'name': 's3-version',
+            'resource': 's3',
+            'filters': [{'Name': bname}],
+            'actions': [
+                {'type': 'toggle-logging', 'enabled': False}]},
+            session_factory=session_factory)
+
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+
+        # eventual consistency fun for recording
+        #time.sleep(10)
+        logging = client.get_bucket_logging(Bucket=bname)['Status']
+        self.assertEqual('Disabled', logging)
+
     def test_encrypt_policy(self):
         self.patch(s3, 'S3_AUGMENT_TABLE', [
             ('get_bucket_policy',  'Policy', None, 'Policy'),
@@ -701,15 +777,58 @@ class S3Test(BaseTest):
         self.addCleanup(destroyBucket, client, bname)
         generateBucketContents(session.resource('s3'), bname)
 
+        # start with a report-only option since it doesn't modify the bucket
+        report_policy = self.load_policy({
+            'name': 'encrypt-keys',
+            'resource': 's3',
+            'filters': [{'Name': bname}],
+            'actions': [{'type': 'encrypt-keys',
+                         'report-only': True}]},
+            session_factory=session_factory)
+        report_resources = report_policy.run()
+
+        self.assertEqual(report_resources[0]['KeyRemediated'], 3)
+
         p = self.load_policy({
             'name': 'encrypt-keys',
             'resource': 's3',
             'filters': [{'Name': bname}],
             'actions': ['encrypt-keys']}, session_factory=session_factory)
-        resources = p.run()
+        p.run()
 
         self.assertTrue(
             'ServerSideEncryption' in client.head_object(
+                Bucket=bname, Key='home.txt'))
+
+        # re-run the report policy after to ensure we have no items
+        # needing remediation
+        report_resources = report_policy.run()
+        self.assertEqual(report_resources[0]['KeyRemediated'], 0)
+
+    def test_encrypt_keys_key_id_option(self):
+        self.patch(s3, 'S3_AUGMENT_TABLE', [])
+        session_factory = self.replay_flight_data(
+            'test_s3_encrypt_key_id_option')
+        bname = "custodian-encrypt-test"
+
+        session = session_factory()
+        client = session.client('s3')
+        client.create_bucket(Bucket=bname)
+        self.addCleanup(destroyBucket, client, bname)
+        generateBucketContents(session.resource('s3'), bname)
+
+        p = self.load_policy({
+            'name': 'encrypt-keys',
+            'resource': 's3',
+            'filters': [{'Name': bname}],
+            'actions': [{'type': 'encrypt-keys',
+                         'crypto': 'aws:kms',
+                         'key-id': '662c9918-50cb-4644-bf82-e34fd4ae710c'}]},
+            session_factory=session_factory)
+        p.run()
+
+        self.assertTrue(
+            'SSEKMSKeyId' in client.head_object(
                 Bucket=bname, Key='home.txt'))
 
     def test_global_grants_filter_option(self):

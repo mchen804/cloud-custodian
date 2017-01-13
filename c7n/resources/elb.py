@@ -19,7 +19,8 @@ import logging
 
 from botocore.exceptions import ClientError
 
-from c7n.actions import ActionRegistry, BaseAction, AutoTagUser
+from c7n.actions import (
+    ActionRegistry, BaseAction, AutoTagUser, ModifyVpcSecurityGroupsAction)
 from c7n.filters import (
     Filter, FilterRegistry, FilterValidationError, DefaultVpcBase, ValueFilter)
 import c7n.filters.vpc as net_filters
@@ -41,10 +42,34 @@ filters.register('marked-for-op', tags.TagActionFilter)
 @resources.register('elb')
 class ELB(QueryResourceManager):
 
-    resource_type = "aws.elb.loadbalancer"
+    class resource_type(object):
+        service = 'elb'
+        type = 'loadbalancer'
+        enum_spec = ('describe_load_balancers',
+                     'LoadBalancerDescriptions', None)
+        detail_spec = None
+        id = 'LoadBalancerName'
+        filter_name = 'LoadBalancerNames'
+        filter_type = 'list'
+        name = 'DNSName'
+        date = 'CreatedTime'
+        dimension = 'LoadBalancerName'
+
+        default_report_fields = (
+            'LoadBalancerName',
+            'DNSName',
+            'VPCId',
+            'count:Instances',
+            'list:ListenerDescriptions[].Listener.LoadBalancerPort')
+
     filter_registry = filters
     action_registry = actions
     retry = staticmethod(get_retry(('Throttling',)))
+
+    @classmethod
+    def get_permissions(cls):
+        return ('elasticloadbalancing:DescribeLoadBalancers',
+                'elasticloadbalancing:DescribeTags')
 
     def augment(self, resources):
         _elb_tags(
@@ -83,8 +108,28 @@ def _elb_tags(elbs, session_factory, executor_factory, retry):
 
 @actions.register('mark-for-op')
 class TagDelayedAction(tags.TagDelayedAction):
+    """Action to specify an action to occur at a later date
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: elb-delete-unused
+                resource: elb
+                filters:
+                  - "tag:custodian_cleanup": absent
+                  - Instances: []
+                actions:
+                  - type: mark-for-op
+                    tag: custodian_cleanup
+                    msg: "Unused ELB - No Instances: {op}@{action_date}"
+                    op: delete
+                    days: 7
+    """
 
     batch_size = 1
+    permissions = ('elasticloadbalancing:AddTags',)
 
     def process_resource_set(self, resource_set, tags):
         client = local_session(self.manager.session_factory).client('elb')
@@ -95,8 +140,25 @@ class TagDelayedAction(tags.TagDelayedAction):
 
 @actions.register('tag')
 class Tag(tags.Tag):
+    """Action to add tag(s) to ELB(s)
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: elb-add-owner-tag
+                resource: elb
+                filters:
+                  - "tag:OwnerName": missing
+                actions:
+                  - type: tag
+                    key: OwnerName
+                    value: OwnerName
+    """
 
     batch_size = 1
+    permissions = ('elasticloadbalancing:AddTags',)
 
     def process_resource_set(self, resource_set, tags):
         client = local_session(
@@ -108,8 +170,24 @@ class Tag(tags.Tag):
 
 @actions.register('remove-tag')
 class RemoveTag(tags.RemoveTag):
+    """Action to remove tag(s) from ELB(s)
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: elb-remove-old-tag
+                resource: elb
+                filters:
+                  - "tag:OldTagKey": present
+                actions:
+                  - type: remove-tag
+                    key: OldTagKey
+    """
 
     batch_size = 1
+    permissions = ('elasticloadbalancing:RemoveTags',)
 
     def process_resource_set(self, resource_set, tag_keys):
         client = local_session(
@@ -121,8 +199,26 @@ class RemoveTag(tags.RemoveTag):
 
 @actions.register('delete')
 class Delete(BaseAction):
+    """Action to delete ELB(s)
+
+    It is recommended to apply a filter to the delete policy to avoid unwanted
+    deletion of any load balancers.
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: elb-delete-unused
+                resource: elb
+                filters:
+                  - Instances: []
+                actions:
+                  - delete
+    """
 
     schema = type_schema('delete')
+    permissions = ('elasticloadbalancing:DeleteLoadBalancer',)
 
     def process(self, load_balancers):
         with self.executor_factory(max_workers=2) as w:
@@ -137,12 +233,33 @@ class Delete(BaseAction):
 
 @actions.register('set-ssl-listener-policy')
 class SetSslListenerPolicy(BaseAction):
+    """Action to set the ELB SSL listener policy
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: elb-set-listener-policy
+                resource: elb
+                actions:
+                  - type: set-ssl-listener-policy
+                    name: SSLNegotiation-Policy-01
+                    attributes:
+                      - Protocol-SSLv3
+                      - Protocol-TLSv1.1
+                      - DHE-RSA-AES256-SHA256
+    """
 
     schema = type_schema(
         'set-ssl-listener-policy',
         name={'type': 'string'},
         attributes={'type': 'array', 'items': {'type': 'string'}},
         required=['name', 'attributes'])
+
+    permissions = (
+        'elasticloadbalancing:CreateLoadBalancerPolicy',
+        'elasticloadbalancing:SetLoadBalancerPoliciesOfListener')
 
     def process(self, load_balancers):
         with self.executor_factory(max_workers=3) as w:
@@ -171,7 +288,7 @@ class SetSslListenerPolicy(BaseAction):
                 PolicyTypeName='SSLNegotiationPolicyType',
                 PolicyAttributes=policy_attributes)
         except ClientError as e:
-            if e.response['Error']['Code'] in (
+            if e.response['Error']['Code'] not in (
                     'DuplicatePolicyName', 'DuplicationPolicyNameException'):
                 raise
 
@@ -193,6 +310,22 @@ class SetSslListenerPolicy(BaseAction):
                     PolicyNames=policy_names)
 
 
+@actions.register('modify-security-groups')
+class ELBModifyVpcSecurityGroups(ModifyVpcSecurityGroupsAction):
+    """Modify VPC security groups on an ELB."""
+
+    permissions = ('elasticloadbalancing:ApplySecurityGroupsToLoadBalancer',)
+
+    def process(self, load_balancers):
+        client = local_session(self.manager.session_factory).client('elb')
+        groups = super(ELBModifyVpcSecurityGroups, self).get_groups(
+            load_balancers, 'SecurityGroups')
+        for idx, l in enumerate(load_balancers):
+            client.apply_security_groups_to_load_balancer(
+                LoadBalancerName=l['LoadBalancerName'],
+                SecurityGroups=groups[idx])
+
+
 def is_ssl(b):
     for ld in b['ListenerDescriptions']:
         if ld['Listener']['Protocol'] in ('HTTPS', 'SSL'):
@@ -202,35 +335,49 @@ def is_ssl(b):
 
 @filters.register('security-group')
 class SecurityGroupFilter(net_filters.SecurityGroupFilter):
+    """ELB security group filter"""
 
     RelatedIdsExpression = "SecurityGroups[]"
 
 
 @filters.register('subnet')
 class SubnetFilter(net_filters.SubnetFilter):
+    """ELB subnet filter"""
 
     RelatedIdsExpression = "Subnets[]"
 
 
 @filters.register('instance')
 class Instance(ValueFilter):
+    """Filter ELB by an associated instance value(s)
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: elb-image-filter
+                resource: elb
+                filters:
+                  - type: instance
+                    key: ImageId
+                    value: ami-01ab23cd
+    """
 
     schema = type_schema('instance', rinherit=ValueFilter.schema)
-
     annotate = False
 
+    def get_permissions(self):
+        return self.manager.get_resource_manager('ec2').get_permissions()
+
     def process(self, resources, event=None):
+        self.elb_instances = {}
         instances = []
         for r in resources:
             instances.extend([i['InstanceId'] for i in r['Instances']])
-        instances = set(instances)
-        from c7n.resources.ec2 import EC2
-        manager = EC2(self.manager.ctx, {})
-
-        self.elb_instances = {}
-        for i in manager.resources():
-            if i['InstanceId'] in instances:
-                self.elb_instances[i['InstanceId']] = i
+        for i in self.manager.get_resource_manager(
+                'ec2').get_resources(list(instances)):
+            self.elb_instances[i['InstanceId']] = i
         return super(Instance, self).process(resources, event)
 
     def __call__(self, elb):
@@ -241,12 +388,24 @@ class Instance(ValueFilter):
                 matched.append(instance)
         if not matched:
             return False
-        elb['MatchedInstances'] = matched
+        elb['c7n:MatchedInstances'] = matched
         return True
 
 
 @filters.register('is-ssl')
 class IsSSLFilter(Filter):
+    """Filters ELB that are using a SSL policy
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: elb-using-ssl
+                resource: elb
+                filters:
+                  - type: is-ssl
+    """
 
     schema = type_schema('is-ssl')
 
@@ -259,13 +418,24 @@ class SSLPolicyFilter(Filter):
     """Filter ELBs on the properties of SSLNegotation policies.
     TODO: Only works on custom policies at the moment.
 
-    filters:
-      - type: ssl-policy
+    whitelist: filter all policies containing permitted protocols
+    blacklist: filter all policies containing forbidden protocols
 
-        whitelist: []
-        blacklist:
-        - "Protocol-SSLv2"
-        - "Protocol-SSLv3"
+    Cannot specify both whitelist & blacklist in the same policy. These must
+    be done seperately (seperate policy statements).
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: elb-ssl-policies
+                resource: elb
+                filters:
+                  - type: ssl-policy
+                    blacklist:
+                        - "Protocol-SSLv2"
+                        - "Protocol-SSLv3"
     """
 
     schema = {
@@ -281,6 +451,7 @@ class SSLPolicyFilter(Filter):
             'blacklist': {'type': 'array', 'items': {'type': 'string'}}
             }
         }
+    permissions = ("elasticloadbalancing:DescribeLoadBalancerPolicies",)
 
     def validate(self):
         if 'whitelist' in self.data and 'blacklist' in self.data:
@@ -309,12 +480,14 @@ class SSLPolicyFilter(Filter):
         if blacklist:
             for elb, active_policies in active_policy_attribute_tuples:
                 if len(blacklist.intersection(active_policies)) > 0:
-                    elb["ProhibitedPolicies"] = list(blacklist.intersection(active_policies))
+                    elb["ProhibitedPolicies"] = list(
+                        blacklist.intersection(active_policies))
                     invalid_elbs.append(elb)
         elif whitelist:
             for elb, active_policies in active_policy_attribute_tuples:
                 if len(set(active_policies).difference(whitelist)) > 0:
-                    elb["ProhibitedPolicies"] = list(set(active_policies).difference(whitelist))
+                    elb["ProhibitedPolicies"] = list(
+                        set(active_policies).difference(whitelist))
                     invalid_elbs.append(elb)
         return invalid_elbs
 
@@ -406,7 +579,20 @@ class SSLPolicyFilter(Filter):
 
 @filters.register('healthcheck-protocol-mismatch')
 class HealthCheckProtocolMismatch(Filter):
-    """
+    """Filters ELB that have a healtch check protocol mismatch
+
+    The mismatch occurs if the ELB has a different protocol to check than
+    the associated instances allow to determine health status.
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: elb-healthcheck-mismatch
+                resource: elb
+                filters:
+                  - type: healthcheck-protocol-mismatch
     """
 
     schema = type_schema('healthcheck-protocol-mismatch')
@@ -431,6 +617,16 @@ class HealthCheckProtocolMismatch(Filter):
 @filters.register('default-vpc')
 class DefaultVpc(DefaultVpcBase):
     """ Matches if an elb database is in the default vpc
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: elb-default-vpc
+                resource: elb
+                filters:
+                  - type: default-vpc
     """
 
     schema = type_schema('default-vpc')

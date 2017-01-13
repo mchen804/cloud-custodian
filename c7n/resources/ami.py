@@ -11,13 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import itertools
 import logging
 
 from c7n.actions import ActionRegistry, BaseAction
 from c7n.filters import FilterRegistry, AgeFilter, Filter, OPERATORS
 
 from c7n.manager import resources
-from c7n.query import QueryResourceManager, ResourceQuery
+from c7n.query import QueryResourceManager
 from c7n.utils import local_session, type_schema
 
 from c7n.resources.ec2 import EC2
@@ -34,9 +35,18 @@ actions = ActionRegistry('ami.actions')
 @resources.register('ami')
 class AMI(QueryResourceManager):
 
-    class resource_type(ResourceQuery.resolve('aws.ec2.image')):
+    class resource_type(object):
+        service = 'ec2'
+        type = 'image'
+        enum_spec = (
+            'describe_images', 'Images', {'Owners': ['self']})
+        detail_spec = None
+        id = 'ImageId'
+        filter_name = 'ImageIds'
+        filter_type = 'list'
+        name = 'Name'
+        dimension = None
         date = 'CreationDate'
-        taggable = True
 
     filter_registry = filters
     action_registry = actions
@@ -64,6 +74,7 @@ class Deregister(BaseAction):
     """
 
     schema = type_schema('deregister')
+    permissions = ('ec2:DeregisterImage',)
 
     def process(self, images):
         with self.executor_factory(max_workers=10) as w:
@@ -78,8 +89,9 @@ class Deregister(BaseAction):
 class RemoveLaunchPermissions(BaseAction):
     """Action to remove the ability to launch an instance from an AMI
 
-    This action will remove any launch permissions granted to other AWS accounts
-    from the image, leaving only the owner capable of launching it
+    This action will remove any launch permissions granted to other
+    AWS accounts from the image, leaving only the owner capable of
+    launching it
 
     :example:
 
@@ -93,12 +105,14 @@ class RemoveLaunchPermissions(BaseAction):
                     days: 60
                 actions:
                   - remove-launch-permissions
+
     """
 
     schema = type_schema('remove-launch-permissions')
+    permissions = ('ec2:ResetImageAttribute',)
 
     def process(self, images):
-        with self.executor_factory(max_workers=10) as w:
+        with self.executor_factory(max_workers=2) as w:
             list(w.map(self.process_image, images))
 
     def process_image(self, image):
@@ -150,6 +164,10 @@ class ImageUnusedFilter(Filter):
     """
 
     schema = type_schema('unused', value={'type': 'boolean'})
+
+    def get_permissions(self):
+        return list(itertools.chain([
+            m.get_permissions() for m in (ASG, LaunchConfig)]))
 
     def _pull_asg_images(self):
         asg_manager = ASG(self.manager.ctx, {})
